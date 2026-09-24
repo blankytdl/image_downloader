@@ -1,8 +1,3 @@
 framework: dockerfile
 dockerfile: Dockerfile
-
-# The bot itself only makes outbound requests (Telegram long-polling +
-# the image-provider APIs) — it doesn't need this port for anything real.
-# It exists so Deplexo's health check has something to hit; bot.py runs a
-# one-route HTTP server on it. Keep this in sync with PORT below.
 port: 8080

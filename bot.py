@@ -34,21 +34,23 @@ import os
 import re
 import shutil
 import tempfile
-import threading
 import time
+import uuid
 import zipfile
 from dataclasses import dataclass
-from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import List, Optional
 
 import aiohttp
 from dotenv import load_dotenv
-from telegram import Update, InputMediaPhoto
+from telegram import Update, InputMediaPhoto, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
     Application,
     CommandHandler,
     ContextTypes,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
 )
 
 load_dotenv()
@@ -80,13 +82,6 @@ MAX_COUNT = 30                     # hard cap per /search call
 MIN_WIDTH_FOR_YOUTUBE = 1280       # HD-ish minimum
 CONCURRENT_DOWNLOADS = 6
 TELEGRAM_DOC_SIZE_LIMIT = 45 * 1024 * 1024  # keep under the 50MB API cap
-
-# Deplexo (and most container hosts) expect the app to be listening on a
-# port so they can health-check it, even though this bot talks to Telegram
-# via outbound long-polling and needs no inbound webhook. PORT is provided
-# by the platform at runtime; 8080 matches the `port:` in deplexo.yaml for
-# local/manual runs. See "Deploying on Deplexo" in README.md.
-PORT = int(os.getenv("PORT", "8080"))
 DOWNLOAD_TIMEOUT = 30
 
 # Providers where the search result URL doesn't reliably carry a file
@@ -512,22 +507,28 @@ def chunk_by_size(paths: List[str], limit_bytes: int) -> List[List[str]]:
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Send /search <query> [count] [provider] [type:png|jpg|gif] [minscore:N] "
-        "to batch-download YouTube-ready photos, anime art, or GIFs.\n\n"
+        "👋 Just send me a word or phrase and I'll show you 4 buttons — "
+        "Google, Stock photos, Safebooru (anime), and GIF — tap one (or "
+        "\"All of the above\") and I'll batch-download and zip the results.\n\n"
+        "For more control, use:\n"
+        "/search <query> [count] [provider] [type:png|jpg|gif] [minscore:N]\n\n"
         "Examples:\n"
+        "cat wearing sunglasses          ← plain message, shows buttons\n"
         "/search \"drone shot of a forest\" 15 pexels\n"
-        "/search hatsune_miku 20 safebooru type:png minscore:80\n"
-        "/search excited cat 15 giphy\n"
-        "/search \"neon city\" google\n\n"
+        "/search hatsune_miku 20 safebooru type:png minscore:80\n\n"
         "Run /providers to see which sources are configured, /help for details."
     )
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "*Commands*\n"
-        "/search <query> [count] [provider] [type:png|jpg|gif] [minscore:N] "
-        "— search & batch-download\n"
+        "*Quick mode*\n"
+        "Type a word or phrase (no command) and I'll show 4 inline buttons — "
+        "Google, Stock, Safebooru, GIF — plus \"All of the above\". Tap one "
+        "and I'll run just that category's search; tap \"All\" to get all 4 "
+        "as separate zips.\n\n"
+        "*Full control*\n"
+        "/search <query> [count] [provider] [type:png|jpg|gif] [minscore:N]\n"
         "  • count: 1-30 (web engines default 10-20, others default 10)\n"
         f"  • provider: one of {', '.join(PROVIDERS.keys())} (default: {DEFAULT_PROVIDER})\n"
         "  • type: keep only this file type — works for ANY provider, any image type "
@@ -548,7 +549,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "For google/serpapi, the file type is sniffed from the actual "
         "downloaded file (not guessed from the URL), since web links often "
         "don't carry an extension — so `type:` still works reliably there.\n\n"
-        "Results are zipped and sent back to you as a document.",
+        "All API keys live in your .env file — see the README for how to get each one.",
         parse_mode=ParseMode.MARKDOWN,
     )
 
@@ -602,7 +603,7 @@ def parse_search_args(raw_args: List[str]):
 
 async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query, count, provider, extra = parse_search_args(context.args)
-    file_type = extra.get("file_type")
+    chat_id = update.effective_chat.id
 
     if not query:
         await update.message.reply_text("Usage: /search <query> [count] [provider]")
@@ -619,148 +620,322 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if count is None:
-        # web search engines default to a 10-20 result batch; everything else keeps its own default
         count = WEB_ENGINE_DEFAULT_COUNT if provider in WEB_ENGINE_PROVIDERS else DEFAULT_COUNT
 
     status_bits = f"🔎 Searching {provider} for “{query}”"
+    file_type = extra.get("file_type")
     if file_type:
         status_bits += f" (type:{file_type})"
     if extra.get("minscore"):
         status_bits += f" (minscore:{extra['minscore']})"
     status_msg = await update.message.reply_text(status_bits + "…")
 
-    job_dir = os.path.join(WORKDIR, f"job_{update.effective_chat.id}_{int(time.time())}")
+    await run_search_job(context, chat_id, query, count, provider, extra, status_msg, label=provider)
+
+
+# ---------------------------------------------------------------------------
+# Category-based search: a plain word/phrase gets 4 inline "glass" buttons
+# (google, stock, safebooru, gif) instead of running automatically. Tapping
+# one runs that category's search with whichever configured provider fits it.
+# ---------------------------------------------------------------------------
+
+CATEGORY_PROVIDER_PRIORITY = {
+    "google": ["google", "serpapi"],
+    "stock": ["pexels", "pixabay", "unsplash"],
+    "safebooru": ["safebooru"],
+    "gif": ["giphy", "tenor"],
+}
+CATEGORY_ORDER = ["google", "stock", "safebooru", "gif"]
+CATEGORY_BUTTON_LABELS = {
+    "google": "🔎 Google",
+    "stock": "🖼 Stock photos",
+    "safebooru": "🎌 Safebooru",
+    "gif": "🎞 GIF",
+}
+PLAIN_TEXT_COUNT = 10  # per-category batch size when triggered via buttons
+
+# Pending queries waiting on a button tap: search_id -> (query, created_at).
+# callback_data has a 64-byte limit, so we pass a short id and look the
+# actual query text up here rather than cramming it into callback_data.
+PENDING_SEARCHES: dict = {}
+PENDING_TTL_SECONDS = 30 * 60
+
+
+def _remember_query(query: str) -> str:
+    now = time.time()
+    # lazy cleanup of stale entries whenever we add a new one
+    stale = [k for k, (_, ts) in PENDING_SEARCHES.items() if now - ts > PENDING_TTL_SECONDS]
+    for k in stale:
+        PENDING_SEARCHES.pop(k, None)
+    search_id = uuid.uuid4().hex[:10]
+    PENDING_SEARCHES[search_id] = (query, now)
+    return search_id
+
+
+def build_category_plan():
+    """Pick one configured provider per category. Returns (available, missing)."""
+    avail_providers = set(configured_providers())
+    plan, missing = [], []
+    for category in CATEGORY_ORDER:
+        chosen_provider = next((p for p in CATEGORY_PROVIDER_PRIORITY[category] if p in avail_providers), None)
+        if chosen_provider:
+            plan.append((category, chosen_provider))
+        else:
+            missing.append(category)
+    return plan, missing
+
+
+async def handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """A plain message with no leading slash shows 4 inline buttons -- one
+    per category -- instead of searching immediately."""
+    query = (update.message.text or "").strip()
+    if not query:
+        return
+
+    plan, missing = build_category_plan()
+    if not plan:
+        await update.message.reply_text(
+            "No providers are configured yet. Add at least one API key to your .env file — see /providers or the README."
+        )
+        return
+
+    search_id = _remember_query(query)
+
+    row = [
+        InlineKeyboardButton(CATEGORY_BUTTON_LABELS[cat], callback_data=f"srch|{cat}|{search_id}")
+        for cat, _ in plan
+    ]
+    keyboard = [row[i:i + 2] for i in range(0, len(row), 2)]  # 2 buttons per row
+    if len(plan) > 1:
+        keyboard.append([InlineKeyboardButton("📦 All of the above", callback_data=f"srch|all|{search_id}")])
+
+    text = f"What would you like for “{query}”?"
+    if missing:
+        text += f"\n(not shown: {', '.join(missing)} — no API key configured)"
+
+    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+
+
+async def handle_category_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cb = update.callback_query
+    await cb.answer()
+
+    parts = (cb.data or "").split("|")
+    if len(parts) != 3 or parts[0] != "srch":
+        return
+    _, category, search_id = parts
+
+    entry = PENDING_SEARCHES.get(search_id)
+    if not entry:
+        await cb.edit_message_text("This search has expired — just send the word again.")
+        return
+    query, _ = entry
+
+    plan, _ = build_category_plan()
+    plan_dict = dict(plan)
+    chat_id = cb.message.chat.id
+
+    if category == "all":
+        await cb.edit_message_text(f"🔎 Searching {', '.join(c for c, _ in plan)} for “{query}”…")
+
+        async def run_one(cat: str, provider: str):
+            status_msg = await context.bot.send_message(chat_id=chat_id, text=f"[{cat}] starting…")
+            await run_search_job(context, chat_id, query, PLAIN_TEXT_COUNT, provider, {}, status_msg, label=cat)
+
+        await asyncio.gather(*[run_one(cat, provider) for cat, provider in plan])
+        PENDING_SEARCHES.pop(search_id, None)
+        return
+
+    provider = plan_dict.get(category)
+    if not provider:
+        await cb.edit_message_text(f"'{category}' isn't configured anymore. Try another option or /providers.")
+        return
+
+    status_msg = await cb.edit_message_text(f"[{category}] 🔎 Searching for “{query}”…")
+    await run_search_job(context, chat_id, query, PLAIN_TEXT_COUNT, provider, {}, status_msg, label=category)
+    PENDING_SEARCHES.pop(search_id, None)
+
+
+async def run_search_job(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    query: str,
+    count: int,
+    provider: str,
+    extra: dict,
+    status_msg,
+    label: Optional[str] = None,
+):
+    """
+    Core search -> download -> zip -> send pipeline, shared by /search and
+    the plain-text multi-category handler. Each call gets its own uniquely
+    named job directory (chat id + provider/label + uuid) so concurrent
+    jobs for the same chat can never collide or clean up each other's files
+    mid-download/zip -- that collision was the cause of jobs silently
+    stalling at the zipping step.
+    """
+    label = label or provider
+    file_type = extra.get("file_type")
+    job_dir = os.path.join(
+        WORKDIR, f"job_{chat_id}_{label}_{uuid.uuid4().hex}"
+    )
     os.makedirs(job_dir, exist_ok=True)
 
     try:
-        async with aiohttp.ClientSession() as session:
-            search_fn = PROVIDERS[provider]
+        job_timeout = 20 + count * 8  # scales with batch size; generous but finite
 
-            # Web search engines (google/serpapi) return arbitrary web-page
-            # URLs that often carry no file extension, so we can't reliably
-            # pre-filter by type from the URL alone -- overfetch candidates
-            # and filter by the real, sniffed type after downloading instead.
-            needs_post_filter = file_type and provider in WEB_ENGINE_PROVIDERS
-            fetch_n = count * 3 if needs_post_filter else count
-            raw_results = await search_fn(session, query, fetch_n, **extra)
+        async def _do_job():
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT)) as session:
+                search_fn = PROVIDERS[provider]
 
-            if needs_post_filter:
-                typed = raw_results  # can't judge type yet; filter after download
-            else:
-                # file-type filter (type:png / type:jpg / type:gif) from the URL,
-                # reliable for providers whose links carry a real extension
-                typed = [r for r in raw_results if matches_file_type(r, file_type)]
+                # Web search engines (google/serpapi) return arbitrary web-page
+                # URLs that often carry no file extension, so we can't reliably
+                # pre-filter by type from the URL alone -- overfetch candidates
+                # and filter by the real, sniffed type after downloading instead.
+                needs_post_filter = bool(file_type) and provider in WEB_ENGINE_PROVIDERS
+                fetch_n = count * 3 if needs_post_filter else count
+                raw_results = await search_fn(session, query, fetch_n, **extra)
+                logger.info("[%s/%s] %d raw results for %r", label, provider, len(raw_results), query)
 
-            # orientation/resolution filter -- skipped for booru/GIF-style
-            # sources, where portrait art and animated GIFs are expected
-            if provider in SKIP_ORIENTATION_FILTER:
-                filtered = typed
-            else:
-                filtered = [r for r in typed if is_youtube_friendly(r)]
-                if not filtered:
-                    filtered = typed  # fall back rather than return nothing
+                if needs_post_filter:
+                    typed = raw_results  # can't judge type yet; filter after download
+                else:
+                    typed = [r for r in raw_results if matches_file_type(r, file_type)]
 
-            chosen = filtered[: (count * 3 if needs_post_filter else count)]
+                if provider in SKIP_ORIENTATION_FILTER:
+                    filtered = typed
+                else:
+                    filtered = [r for r in typed if is_youtube_friendly(r)]
+                    if not filtered:
+                        filtered = typed
 
-            if not chosen:
-                msg = "No results found. Try a different query"
-                if file_type:
-                    msg += f" or a different type (no {file_type} results)"
-                await status_msg.edit_text(msg + ".")
+                chosen = filtered[: (count * 3 if needs_post_filter else count)]
+
+                if not chosen:
+                    msg = f"[{label}] No results found for “{query}”"
+                    if file_type:
+                        msg += f" (type:{file_type})"
+                    await status_msg.edit_text(msg + ".")
+                    return
+
+                await status_msg.edit_text(f"[{label}] ⬇️ Downloading {len(chosen)} files…")
+
+                sem = asyncio.Semaphore(CONCURRENT_DOWNLOADS)
+                downloaded = await asyncio.gather(
+                    *[download_one(session, img, job_dir, sem) for img in chosen],
+                    return_exceptions=True,
+                )
+                paths = [p for p in downloaded if isinstance(p, str)]
+                failures = len(downloaded) - len(paths)
+                if failures:
+                    logger.warning("[%s/%s] %d/%d downloads failed", label, provider, failures, len(downloaded))
+
+                if needs_post_filter:
+                    wanted_ext = file_type.lower().lstrip(".")
+                    wanted_set = {"jpg", "jpeg"} if wanted_ext in ("jpg", "jpeg") else {wanted_ext}
+                    paths = [p for p in paths if p.rsplit(".", 1)[-1].lower() in wanted_set]
+
+                paths = paths[:count]
+
+            if not paths:
+                msg = f"[{label}] All {failures or len(chosen)} downloads failed."
+                if needs_post_filter:
+                    msg = f"[{label}] None of the results were actually {file_type} files after downloading."
+                await status_msg.edit_text(msg + " Try a different query or provider.")
                 return
 
-            await status_msg.edit_text(f"⬇️ Downloading {len(chosen)} images…")
+            await status_msg.edit_text(f"[{label}] 📦 Zipping {len(paths)} files…")
 
-            sem = asyncio.Semaphore(CONCURRENT_DOWNLOADS)
-            downloaded = await asyncio.gather(*[
-                download_one(session, img, job_dir, sem) for img in chosen
-            ])
-            paths = [p for p in downloaded if p]
+            zip_path = os.path.join(job_dir, "files.zip")
+            try:
+                zip_files(paths, zip_path)
+            except Exception:
+                logger.exception("[%s/%s] zipping failed (job_dir=%s)", label, provider, job_dir)
+                await status_msg.edit_text(f"[{label}] ⚠️ Failed while zipping the downloaded files.")
+                return
 
-            if needs_post_filter:
-                # now that files are on disk, filter by their actual sniffed extension
-                wanted_ext = file_type.lower().lstrip(".")
-                wanted_set = {"jpg", "jpeg"} if wanted_ext in ("jpg", "jpeg") else {wanted_ext}
-                paths = [p for p in paths if p.rsplit(".", 1)[-1].lower() in wanted_set]
+            safe_query = re.sub(r"[^a-zA-Z0-9]+", "_", query)[:30]
 
-            paths = paths[:count]
-
-        if not paths:
-            msg = "Downloads all failed. Try again or pick another provider."
-            if needs_post_filter:
-                msg = f"None of the results were actually {file_type} files after downloading. Try a different query or provider."
-            await status_msg.edit_text(msg)
-            return
-
-        await status_msg.edit_text(f"📦 Zipping {len(paths)} images…")
-
-        zip_path = os.path.join(job_dir, "photos.zip")
-        zip_files(paths, zip_path)
-
-        if os.path.getsize(zip_path) <= TELEGRAM_DOC_SIZE_LIMIT:
-            with open(zip_path, "rb") as f:
-                await update.message.reply_document(
-                    document=f,
-                    filename=f"{provider}_{re.sub(r'[^a-zA-Z0-9]+', '_', query)[:40]}.zip",
-                    caption=f"{len(paths)} photos from {provider} for “{query}”",
-                )
-        else:
-            # zip too big for one message -- split the raw files into
-            # size-safe batches and zip+send each batch separately
-            os.remove(zip_path)
-            batches = chunk_by_size(paths, TELEGRAM_DOC_SIZE_LIMIT)
-            for i, batch in enumerate(batches, start=1):
-                batch_zip = os.path.join(job_dir, f"photos_part{i}.zip")
-                zip_files(batch, batch_zip)
-                with open(batch_zip, "rb") as f:
-                    await update.message.reply_document(
+            if os.path.getsize(zip_path) <= TELEGRAM_DOC_SIZE_LIMIT:
+                with open(zip_path, "rb") as f:
+                    await context.bot.send_document(
+                        chat_id=chat_id,
                         document=f,
-                        filename=f"{provider}_{re.sub(r'[^a-zA-Z0-9]+', '_', query)[:30]}_part{i}.zip",
-                        caption=f"Part {i}/{len(batches)}",
+                        filename=f"{label}_{safe_query}.zip",
+                        caption=f"[{label}] {len(paths)} files for “{query}”",
                     )
+            else:
+                # zip too big for one message -- split the raw files into
+                # size-safe batches and zip+send each batch separately
+                os.remove(zip_path)
+                batches = chunk_by_size(paths, TELEGRAM_DOC_SIZE_LIMIT)
+                for i, batch in enumerate(batches, start=1):
+                    batch_zip = os.path.join(job_dir, f"files_part{i}.zip")
+                    zip_files(batch, batch_zip)
+                    with open(batch_zip, "rb") as f:
+                        await context.bot.send_document(
+                            chat_id=chat_id,
+                            document=f,
+                            filename=f"{label}_{safe_query}_part{i}.zip",
+                            caption=f"[{label}] Part {i}/{len(batches)}",
+                        )
 
-        await status_msg.edit_text(f"✅ Done — sent {len(paths)} photos.")
+            await status_msg.edit_text(f"[{label}] ✅ Done — sent {len(paths)} files.")
 
+        await asyncio.wait_for(_do_job(), timeout=job_timeout)
+
+    except asyncio.TimeoutError:
+        await status_msg.edit_text(f"[{label}] ⚠️ Timed out after {job_timeout}s. Try a smaller count or a different provider.")
     except RuntimeError as e:
-        await status_msg.edit_text(f"⚠️ {e}")
+        await status_msg.edit_text(f"[{label}] ⚠️ {e}")
     except aiohttp.ClientError as e:
-        await status_msg.edit_text(f"⚠️ Network/API error: {e}")
+        await status_msg.edit_text(f"[{label}] ⚠️ Network/API error: {e}")
     except Exception as e:
-        logger.exception("search_cmd failed")
-        await status_msg.edit_text(f"⚠️ Unexpected error: {e}")
+        logger.exception("[%s/%s] run_search_job failed", label, provider)
+        await status_msg.edit_text(f"[{label}] ⚠️ Unexpected error: {e}")
     finally:
         shutil.rmtree(job_dir, ignore_errors=True)
 
 
-class _HealthHandler(BaseHTTPRequestHandler):
-    """Bare-bones handler so the platform's port health check gets a 200."""
+# ---------------------------------------------------------------------------
+# Deplexo compatibility: the platform's default deplexo.yaml expects an app
+# to listen on a port (see deplexo.yaml in this repo), even though this bot
+# is a pure long-polling background worker with no real HTTP surface. This
+# spins up a tiny health-check endpoint on $PORT alongside the bot so the
+# platform can see the container is alive. It's a no-op with no downside if
+# your Deplexo plan/app type doesn't require it.
+# ---------------------------------------------------------------------------
 
-    def do_GET(self):
-        self.send_response(200)
-        self.send_header("Content-Type", "text/plain")
-        self.end_headers()
-        self.wfile.write(b"ok")
+async def start_health_server(app: Application):
+    from aiohttp import web
 
-    def log_message(self, format, *args):  # noqa: A002 - silence default access logs
-        pass
+    port = int(os.getenv("PORT", "8080"))
 
+    async def health(_request):
+        return web.Response(text="ok")
 
-def _start_health_server():
-    HTTPServer(("0.0.0.0", PORT), _HealthHandler).serve_forever()
+    web_app = web.Application()
+    web_app.router.add_get("/", health)
+    web_app.router.add_get("/health", health)
+
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info("Health check server listening on 0.0.0.0:%d", port)
 
 
 def main():
     if not TELEGRAM_BOT_TOKEN:
         raise SystemExit("Set TELEGRAM_BOT_TOKEN in your environment or .env file before running.")
 
-    threading.Thread(target=_start_health_server, daemon=True).start()
-    logger.info("Health check server listening on 0.0.0.0:%s", PORT)
-
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(start_health_server).build()
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("providers", providers_cmd))
     app.add_handler(CommandHandler("search", search_cmd))
+    app.add_handler(CallbackQueryHandler(handle_category_button, pattern=r"^srch\|"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_plain_text))
 
     logger.info("Bot starting… configured providers: %s", configured_providers())
     app.run_polling()

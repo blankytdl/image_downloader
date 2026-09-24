@@ -1,66 +1,32 @@
 # Telegram Photo Search & Batch-Download Bot
 
-Searches stock-photo APIs for images suitable for YouTube editing
-(landscape orientation, high resolution) and sends you a zip of the
-results, downloaded in batch.
+Send the bot a word or phrase and it searches **4 categories at once —
+google, stock photos, safebooru (anime), and gif** — downloading each
+result set in batch and sending you back a zip per category. You can
+also use `/search` directly for full control over provider, count,
+and file type.
 
-## Why not just scrape Google Images?
+## Quick start
 
-Scraping Google Image search results directly (a) violates Google's
-Terms of Service, and (b) mostly returns copyrighted photos that
-aren't cleared for reuse — using them in a monetized YouTube video is
-a common way to get a copyright claim or strike.
+```bash
+pip install -r requirements.txt
+cp .env.example .env      # then fill in your keys, see below
+python bot.py
+```
 
-Instead, this bot uses **Pexels, Pixabay, and Unsplash** — all free
-APIs whose licenses explicitly permit use in video content, with no
-attribution required (attribution is still appreciated, per each
-site's terms). It also includes an *optional* Google Custom Search
-image provider for cases where you specifically want to search the
-open web — it's off unless you configure it, and you're responsible
-for checking the license of anything you download that way before
-publishing.
+In Telegram, just type something like:
 
-For anime screenshots/character art, it also includes **Safebooru**
-(safe-rated only, no API key required) — search by character/tag,
-results are always sorted by score, and you can filter to a specific
-file type (PNG/JPG/GIF) or set a minimum score.
+```
+cat wearing sunglasses
+```
 
-For GIFs, it includes **Giphy** and **Tenor** (both free, key-based).
+...and the bot replies with 4 inline "glass" buttons — **Google**,
+**Stock photos**, **Safebooru**, **GIF** — plus **All of the above**.
+Tap one to run just that category's search, or tap "All" to get all 4
+as separate zips. Categories with no API key configured simply don't
+get a button (and the message tells you which ones were skipped).
 
-For actual Google/web image results beyond what the free Custom
-Search tier indexes, it includes **SerpApi** (paid, ~$0.01-0.015 per
-search) as a `serpapi` provider — a real pass-through to Google
-Images. Note: **Microsoft retired the Bing Image Search API in August
-2025**, so there is currently no equivalent free/official "Bing"
-option to add here; SerpApi (or a paid scraping service) is the
-practical route to real web image search results now.
-
-### A note on "type:" filtering for web search results
-
-Google/SerpApi links are ordinary web-page URLs and often carry no
-file extension at all, unlike stock/booru/GIF APIs. So for those two
-providers, the bot over-fetches candidates, downloads them, sniffs
-the *actual* file type from the HTTP response, and only then applies
-your `type:` filter — this makes `type:png`/`type:gif`/etc. reliable
-even though the source URLs don't advertise their type up front.
-
-## Setup
-
-1. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-2. Copy `.env.example` to `.env` and fill in:
-   - `TELEGRAM_BOT_TOKEN` — create a bot via [@BotFather](https://t.me/BotFather) on Telegram, it will give you a token.
-   - At least one of `PEXELS_API_KEY`, `PIXABAY_API_KEY`, `UNSPLASH_ACCESS_KEY` (all free, sign up on their developer pages, links in `.env.example`).
-3. Run it:
-   ```bash
-   python bot.py
-   ```
-
-## Using the bot
-
-In Telegram, message your bot:
+For more control, use `/search` directly:
 
 ```
 /search drone shot of a forest
@@ -73,57 +39,210 @@ In Telegram, message your bot:
 /help
 ```
 
-- `count` (optional): how many images to fetch. Web engines (`google`/`serpapi`) default to **15** if you don't specify one (i.e. the 10-20 range); other providers default to 10. Max 30 either way.
-- `provider` (optional): `pexels`, `pixabay`, `unsplash`, `safebooru`, `giphy`, `tenor`, `google`, or `serpapi` (whichever have keys configured). Defaults to whatever `DEFAULT_PROVIDER` is set to in `.env`.
-- `type:png` / `type:jpg` / `type:gif` / `type:webp` / `type:bmp` / `type:tiff` / `type:svg` (optional): only keep results of that file type. Works with **any** provider and any image type — handy for grabbing transparent-PNG overlays or GIFs specifically.
-- `minscore:N` (optional, Safebooru only): drop any result scoring below N, so you only get well-liked/curated art for that character rather than everything tagged with their name.
+- `count` (optional): how many files to fetch. Web engines
+  (`google`/`serpapi`) default to **15** if omitted (the 10-20 range);
+  other providers default to 10. Max 30. The button-triggered
+  category searches use 10 per category.
+- `provider` (optional): `pexels`, `pixabay`, `unsplash`, `safebooru`,
+  `giphy`, `tenor`, `google`, or `serpapi`. Defaults to whatever
+  `DEFAULT_PROVIDER` is set to in `.env`.
+- `type:png` / `type:jpg` / `type:gif` / `type:webp` / `type:bmp` /
+  `type:tiff` / `type:svg` (optional): only keep results of that file
+  type. Works with **any** provider and any image type.
+- `minscore:N` (optional, Safebooru only): drop anything scoring
+  below N.
 
-### Safebooru specifics
+## Why not just scrape Google Images?
 
-- Query = character name and/or tags. Multiple tags: separate with commas (`hatsune_miku, vocaloid`); spaces within a tag become underscores automatically (`hatsune miku` → `hatsune_miku`), matching booru tag conventions.
-- Results are **always** requested sorted by score (highest first), so the character's most popular/cleanest art comes first — `minscore` just lets you hard-cut anything below a threshold instead of relying on sort order alone.
-- Safebooru only hosts safe-rated content (no NSFW), so it's already filtered that way at the source.
-- Character art is often portrait-oriented, so — unlike the stock providers — Safebooru results are *not* filtered to landscape/high-res; use `type:png` if you specifically want overlay-style transparent PNGs.
+Scraping Google Image search results directly (a) violates Google's
+Terms of Service, and (b) mostly returns copyrighted photos that
+aren't cleared for reuse — using them in a monetized YouTube video is
+a common way to get a copyright claim or strike.
 
-The bot filters results to landscape orientation and at least 1280px
-wide (editable via `MIN_WIDTH_FOR_YOUTUBE` in `bot.py`), downloads
-them concurrently, zips them, and sends the zip back. If the batch is
-too big for a single Telegram message (>45MB), it automatically
-splits the download into multiple zip parts.
+Instead:
+- **Pexels, Pixabay, Unsplash** — free APIs whose licenses explicitly
+  permit use in video content.
+- **Safebooru** — safe-rated anime art/screenshots, no key needed.
+- **Giphy / Tenor** — GIFs, free keys.
+- **Google Custom Search** — a curated, official, free-tier (100
+  queries/day) way to pull real image URLs from the web, scoped to a
+  search engine you configure.
+- **SerpApi** (optional, paid) — a real pass-through to actual Google
+  Images results, for when the CSE's curated index doesn't have what
+  you want. Note: **Microsoft retired the Bing Image Search API in
+  August 2025**, so there's currently no free/official Bing
+  equivalent to offer here.
+
+Even with these sources, skim each site's specific license terms
+before publishing — most allow commercial/video use but details
+differ (e.g. around depicting recognizable people or trademarks), and
+anything you pull via Google/SerpApi is an arbitrary web image whose
+license you're responsible for checking yourself.
+
+## Getting each API key
+
+All keys go in your `.env` file (copied from `.env.example`). You
+only need keys for the providers you actually want to use — the bot
+skips any category with no key configured and tells you which ones
+it skipped.
+
+| Variable | Provider | Required? |
+|---|---|---|
+| `TELEGRAM_BOT_TOKEN` | Telegram | **Yes**, always |
+| `PEXELS_API_KEY` | Pexels (stock) | One of the 3 stock keys, for the "stock" category |
+| `PIXABAY_API_KEY` | Pixabay (stock) | " |
+| `UNSPLASH_ACCESS_KEY` | Unsplash (stock) | " |
+| `GOOGLE_CSE_API_KEY` + `GOOGLE_CSE_ENGINE_ID` | Google Custom Search | For the "google" category (free option) |
+| `SERPAPI_KEY` | SerpApi | For the "google" category (paid, real Google Images) |
+| `GIPHY_API_KEY` | Giphy | One of the 2 gif keys |
+| `TENOR_API_KEY` | Tenor | " |
+| — | Safebooru | No key needed, works out of the box |
+
+### Telegram Bot Token
+1. Open Telegram, message **[@BotFather](https://t.me/BotFather)**.
+2. Send `/newbot`, follow the prompts (choose a name and a username
+   ending in `bot`).
+3. BotFather replies with a token like `123456:ABC-DEF...`. Put it in
+   `TELEGRAM_BOT_TOKEN`.
+
+### Pexels (stock photos)
+1. Go to https://www.pexels.com/api/ and sign in / create a free account.
+2. Click "Get Started" — you're given an API key immediately, no
+   approval wait.
+3. Put it in `PEXELS_API_KEY`. Free tier: 200 requests/hour, 20,000/month.
+
+### Pixabay (stock photos)
+1. Create a free account at https://pixabay.com/.
+2. Go to https://pixabay.com/api/docs/ — your API key is shown at the
+   top of that page once logged in.
+3. Put it in `PIXABAY_API_KEY`. Free, generous rate limits.
+
+### Unsplash (stock photos)
+1. Create a developer account at https://unsplash.com/developers.
+2. Click "New Application", accept the API terms, name it anything.
+3. Your **Access Key** is shown on the app's page — put it in
+   `UNSPLASH_ACCESS_KEY`.
+4. Free ("Demo") tier is capped at 50 requests/hour — fine for
+   personal use; apply for production access from the same dashboard
+   if you need more.
+
+### Google Custom Search (free "google" option)
+1. Create a Programmable Search Engine at
+   https://programmablesearchengine.google.com/ — click "Add",
+   give it any name, and for "What to search" choose "Search the
+   entire web".
+2. Open the new engine's settings and turn **"Image search"** ON.
+3. Copy the **Search engine ID** (also called `cx`) from the setup
+   page — put it in `GOOGLE_CSE_ENGINE_ID`.
+4. Get an API key for the Custom Search JSON API at
+   https://developers.google.com/custom-search/v1/introduction —
+   click "Get a Key", create/select a Google Cloud project, and copy
+   the generated key into `GOOGLE_CSE_API_KEY`.
+5. Free tier: 100 queries/day; billing can be enabled on the same
+   Cloud project for more, at $5 per 1,000 queries.
+
+### SerpApi (paid "google" option, real Google Images)
+1. Sign up at https://serpapi.com/ (a small number of free searches
+   are included on signup for testing).
+2. Your API key is on your https://serpapi.com/dashboard — put it in
+   `SERPAPI_KEY`.
+3. Paid plans start around $50/month for 5,000 searches (~1¢ each);
+   check their pricing page for current rates.
+
+### Giphy (GIFs)
+1. Create an account and an app at https://developers.giphy.com/dashboard/.
+2. Click "Create an App" → choose "API" (not SDK) → give it a name.
+3. Copy the generated API key into `GIPHY_API_KEY`. Free tier is
+   generous for personal/bot use; Giphy may ask you to apply for
+   "Production" access if you exceed the beta-key rate limit.
+
+### Tenor (GIFs)
+1. Tenor's API uses a standard Google API key. Go to
+   https://console.cloud.google.com/apis/library and enable the
+   "Tenor API" (formerly listed under Google APIs) for a project.
+2. Create credentials → API key, from
+   https://console.cloud.google.com/apis/credentials.
+3. Put it in `TENOR_API_KEY`. Alternatively, Tenor's own docs at
+   https://tenor.com/gifapi/documentation list a quick-start test key
+   for development — swap in your own before any real usage.
+
+### Safebooru (anime)
+No signup, no key. It's a public, unauthenticated API — just leave it
+configured as-is.
+
+## Bugfix note: jobs stalling at the "zipping" step
+
+If you hit an earlier version of this bot silently stopping partway
+through — status message stuck at "Zipping…" with no file ever
+arriving and no error shown — that was a real concurrency bug: each
+search job wrote its downloads to a temp folder named using a
+whole-second timestamp. Two jobs for the same chat landing in the
+same second (which happens constantly once you're running 4
+categories per message) could share that folder; one job's cleanup
+would then delete files out from under the other mid-download or
+mid-zip, with no exception raised to explain why nothing arrived.
+
+This is fixed: every job now gets its own folder keyed by a random
+UUID (plus the category name), so concurrent jobs can never collide.
+On top of that, each job now:
+- has an overall timeout (scales with how many files you asked for)
+  so a hung request reports a clear timeout message instead of going
+  quiet forever,
+- logs and reports the specific failure if zipping itself throws
+  (previously any such error was still caught, but generic messaging
+  made it easy to mistake for a hang),
+- tolerates individual download failures without aborting the whole
+  batch (`return_exceptions=True`), and
+- is fully independent per category, so one slow/broken provider
+  can't block or corrupt the others' results.
 
 ## Deploying on Deplexo
 
-This repo includes a `Dockerfile` and `deplexo.yaml` so it deploys as-is:
+This repo is ready to deploy on [Deplexo](https://deplexo.com) as-is —
+`Dockerfile`, `deplexo.yaml`, and `.dockerignore` are all included.
 
-1. Push this repo to GitHub and connect it in the Deplexo dashboard.
-2. Set your env vars (`TELEGRAM_BOT_TOKEN` and at least one provider key)
-   under the app's Environment settings — don't commit `.env`.
-3. Deploy. Deplexo builds the `Dockerfile` and starts the container.
+1. Push this repo to GitHub (or wherever Deplexo pulls from).
+2. In the Deplexo dashboard, create a new app from that repository.
+   It picks up `deplexo.yaml`, which points at the included
+   `Dockerfile` and declares port `8080`.
+3. Add your environment variables in the app's **Environment
+   Variables** tab (`TELEGRAM_BOT_TOKEN`, plus whichever provider keys
+   you're using — see "Getting each API key" above). Deplexo's
+   filesystem is read-only at runtime, so this is the only place these
+   values should live; don't bake a `.env` file into the image.
+4. Deploy. The bot runs as a long-polling background process — it has
+   no real web UI — but the container still exposes a tiny health
+   endpoint on port 8080 (`/` and `/health`, both return `ok`) purely
+   so the platform can confirm it's alive; you don't need to do
+   anything with it.
 
-A couple of things worth knowing:
+A couple of things specific to Deplexo's container model:
 
-- **The `port` in `deplexo.yaml` isn't for Telegram traffic.** This bot
-  only does outbound long-polling to Telegram's API, so it never needs an
-  inbound webhook or port. Deplexo's health check still expects the
-  container to answer on a port, though, so `bot.py` runs a trivial
-  one-route HTTP server (`GET /` → `200 ok`) alongside the bot on the
-  `PORT` env var (default `8080`, matching `deplexo.yaml`). It does
-  nothing else — no Telegram traffic goes through it.
-- **Free plan fits, with headroom to watch.** The Free tier gives 128 MB
-  RAM and 250 MB disk. The bot itself is light (no Pillow/image
-  processing), but each `/search` downloads images into a temp folder
-  before zipping, so a big `count` on a free instance can push memory/
-  disk usage — lower `MAX_COUNT`/`CONCURRENT_DOWNLOADS` in `bot.py`, or
-  move to Starter ($5/mo, 512 MB RAM), if you hit limits.
-- **No persistent volume needed.** Downloaded files already live in a
-  per-request temp dir and get deleted after sending (see below), which
-  matches Deplexo's default read-only/ephemeral container filesystem —
-  nothing here relies on data surviving a redeploy.
+- **Read-only filesystem**: the bot already writes its temporary
+  download/zip files under the OS temp directory (`/tmp` in the
+  container), which stays writable even on a read-only root
+  filesystem, and cleans them up after every job. No persistent
+  volume is needed — nothing here needs to survive a redeploy.
+- **Memory**: the **Free** plan gives 128 MB RAM / 0.25 CPU. That's
+  workable for light use of `/search`, but the plain-text "4 buttons"
+  flow can run 4 searches concurrently (each with its own downloads),
+  which can spike memory on a busy request. If you plan to use that
+  feature regularly, the **Starter** plan ($5/mo, 512 MB RAM, 3
+  projects) is a safer fit; drop `CONCURRENT_DOWNLOADS` and
+  `PLAIN_TEXT_COUNT` in `bot.py` if you want to stay on Free.
+- Only one process may long-poll a given bot token at a time — don't
+  run this bot locally and on Deplexo simultaneously with the same
+  token, or Telegram will error on one of them.
 
 ## Notes / things you may want to tweak
 
-- `MAX_COUNT` in `bot.py` caps how many images one `/search` can pull (default 30) — raise it if you need bigger batches, but watch out for provider rate limits.
-- `CONCURRENT_DOWNLOADS` controls parallel downloads (default 6).
-- Downloaded files are stored in a temp folder per-request and deleted after sending — nothing is kept on disk long-term.
-- For heavier use, run this on a small always-on server (a $5 VPS, a Raspberry Pi, etc.) rather than your laptop, since `run_polling()` needs to stay running to receive messages.
-- Even with royalty-free sources, it's worth skimming each site's specific license terms (Pexels, Pixabay, and Unsplash all allow commercial/video use, but details differ, e.g. around depicting recognizable people or trademarked content).
+- `MAX_COUNT` in `bot.py` caps how many files one `/search` can pull
+  (default 30).
+- `PLAIN_TEXT_COUNT` controls how many files each category fetches when
+  triggered via the inline buttons (default 10).
+- `CONCURRENT_DOWNLOADS` controls parallel downloads per job (default 6).
+- Downloaded files live in a per-job temp folder and are deleted right
+  after sending (or on error) — nothing is kept on disk long-term.
+- For heavier use, run this on a small always-on server (a $5 VPS, a
+  Raspberry Pi, etc.) rather than your laptop, since `run_polling()`
+  needs to stay running to receive messages.

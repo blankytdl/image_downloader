@@ -1,14 +1,17 @@
-FROM python:3.11-slim
+# Deplexo (and any Docker-based host) builds from this file.
+FROM python:3.12-slim
 
 WORKDIR /app
 
-# Install deps first so they're cached across rebuilds when only bot.py changes.
+# Install dependencies first so this layer is cached across code-only changes
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY bot.py .
 
-ENV PORT=8080
-EXPOSE 8080
+ENV PYTHONUNBUFFERED=1
 
+# No secrets baked in -- TELEGRAM_BOT_TOKEN and all provider API keys are
+# read from the environment at runtime (set them in Deplexo's Environment
+# Variables tab, not in this image).
 CMD ["python", "bot.py"]
