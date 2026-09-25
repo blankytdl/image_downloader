@@ -115,13 +115,31 @@ class ImageResult:
     score: Optional[int] = None       # booru-style score, None for stock providers
 
 
-def is_youtube_friendly(img: ImageResult) -> bool:
-    """Landscape orientation and reasonably high resolution."""
+SIZE_THRESHOLDS = {"any": 0, "hd": 1280, "fhd": 1920}
+
+
+def passes_size_filter(img: ImageResult, size: str, require_landscape: bool) -> bool:
+    """
+    `size` is one of SIZE_THRESHOLDS's keys and sets a minimum width.
+    `require_landscape` additionally requires width >= height -- used for
+    stock-photo providers (video-editing B-roll), but skipped for booru/GIF
+    sources where portrait art and square/odd-aspect GIFs are normal.
+    Unknown dimensions (0) always pass, since we can't judge them.
+    """
+    threshold = SIZE_THRESHOLDS.get(size, 0)
     if img.width <= 0 or img.height <= 0:
-        return True  # unknown dims, don't filter out
-    landscape = img.width >= img.height
-    hi_res = img.width >= MIN_WIDTH_FOR_YOUTUBE
-    return landscape and hi_res
+        return True
+    if threshold and img.width < threshold:
+        return False
+    if require_landscape and img.width < img.height:
+        return False
+    return True
+
+
+def is_youtube_friendly(img: ImageResult) -> bool:
+    """Landscape orientation and reasonably high resolution (legacy helper,
+    equivalent to passes_size_filter(img, "hd", require_landscape=True))."""
+    return passes_size_filter(img, "hd", require_landscape=True)
 
 
 def url_extension(url: str) -> str:
@@ -176,6 +194,7 @@ async def search_pexels(session: aiohttp.ClientSession, query: str, count: int, 
 async def search_pixabay(session: aiohttp.ClientSession, query: str, count: int, **kwargs) -> List[ImageResult]:
     if not PIXABAY_API_KEY:
         raise RuntimeError("PIXABAY_API_KEY is not set.")
+    order_map = {"popular": "popular", "latest": "latest"}
     params = {
         "key": PIXABAY_API_KEY,
         "q": query,
@@ -183,6 +202,7 @@ async def search_pixabay(session: aiohttp.ClientSession, query: str, count: int,
         "orientation": "horizontal",
         "per_page": max(min(count * 2, 200), 3),  # pixabay minimum per_page is 3
         "safesearch": "true",
+        "order": order_map.get(kwargs.get("sort"), "popular"),
     }
     async with session.get("https://pixabay.com/api/", params=params) as resp:
         resp.raise_for_status()
@@ -203,7 +223,13 @@ async def search_unsplash(session: aiohttp.ClientSession, query: str, count: int
     if not UNSPLASH_ACCESS_KEY:
         raise RuntimeError("UNSPLASH_ACCESS_KEY is not set.")
     headers = {"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"}
-    params = {"query": query, "per_page": min(count * 2, 30), "orientation": "landscape"}
+    order_map = {"popular": "relevant", "latest": "latest"}
+    params = {
+        "query": query,
+        "per_page": min(count * 2, 30),
+        "orientation": "landscape",
+        "order_by": order_map.get(kwargs.get("sort"), "relevant"),
+    }
     async with session.get("https://api.unsplash.com/search/photos", headers=headers, params=params) as resp:
         resp.raise_for_status()
         data = await resp.json()
@@ -219,21 +245,32 @@ async def search_unsplash(session: aiohttp.ClientSession, query: str, count: int
     return results
 
 
+# Safebooru sort options, mapped to the site's own booru-tag sort syntax.
+SAFEBOORU_SORT_TAGS = {
+    "score": "sort:score:desc",   # top / most popular (default)
+    "new": "sort:id:desc",        # most recently posted
+    "random": "sort:random",      # random pick
+}
+
+
 async def search_safebooru(session: aiohttp.ClientSession, query: str, count: int, **kwargs) -> List[ImageResult]:
     """
     Safebooru (safebooru.org) -- anime screenshots/fan art, safe-rated only,
-    no API key required. `query` is treated as one or more booru tags
+    no API key required. `query` must be one or more exact booru tags
     (comma or space separated; spaces inside a tag become underscores, so
-    "hatsune miku" -> "hatsune_miku"). Results are always requested sorted
-    by score (highest first) so the character's most popular/cleanest art
-    comes back first; pass minscore:N via the /search command to also
-    hard-filter out anything below that score.
+    "hatsune miku" -> "hatsune_miku" -- Safebooru's tag matching is strict
+    and won't fuzzy-match natural-language phrasing).
+
+    `sort` selects Safebooru's own ordering: "score" (top, default), "new"
+    (most recent), or "random". `minscore` (any sort mode) additionally
+    hard-filters out anything below that score.
     """
     min_score = int(kwargs.get("minscore", 0) or 0)
+    sort_choice = kwargs.get("sort", "score")
 
     raw_tags = [t.strip() for t in re.split(r"[,\n]", query) if t.strip()]
     tags = [t.replace(" ", "_") for t in raw_tags] if raw_tags else []
-    tags.append("sort:score:desc")  # prioritize by score, as requested
+    tags.append(SAFEBOORU_SORT_TAGS.get(sort_choice, SAFEBOORU_SORT_TAGS["score"]))
     tag_string = " ".join(tags)
 
     params = {
@@ -275,8 +312,59 @@ async def search_safebooru(session: aiohttp.ClientSession, query: str, count: in
             score=score,
         ))
 
-    results.sort(key=lambda r: r.score or 0, reverse=True)
+    # The API is already asked to sort server-side via the tag above; only
+    # re-sort client-side for "score" as a safety net, and never for
+    # "random" (that would defeat the point).
+    if sort_choice == "score":
+        results.sort(key=lambda r: r.score or 0, reverse=True)
     return results
+
+
+async def safebooru_autocomplete(partial: str, limit: int = 8) -> List[str]:
+    """
+    Queries Safebooru's own tag-autocomplete endpoint (the same one that
+    backs the search box on safebooru.org) so the bot can offer real,
+    existing tags instead of guessing at underscore/spelling formatting.
+    Returns a plain list of tag names, best matches first. Returns an empty
+    list on any error or if there's simply no match -- callers should treat
+    that as "fall back to the user's raw text" rather than as a hard failure.
+    """
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get(
+                "https://safebooru.org/autocomplete.php", params={"q": partial}
+            ) as resp:
+                resp.raise_for_status()
+                try:
+                    data = await resp.json(content_type=None)
+                except Exception:
+                    data = []
+    except Exception:
+        logger.warning("Safebooru autocomplete request failed for %r", partial, exc_info=True)
+        return []
+
+    tags: List[str] = []
+    for item in data or []:
+        if isinstance(item, str):
+            tag = item
+        elif isinstance(item, dict):
+            tag = item.get("value") or item.get("label") or ""
+            # Gelbooru-style autocomplete labels often look like
+            # "tag_name (1234)" with a post count -- strip that suffix.
+            tag = re.sub(r"\s*\(\d+\)\s*$", "", tag).strip()
+        else:
+            continue
+        if tag:
+            tags.append(tag)
+
+    seen = set()
+    deduped = []
+    for t in tags:
+        if t not in seen:
+            seen.add(t)
+            deduped.append(t)
+    return deduped[:limit]
 
 
 async def search_google_cse(session: aiohttp.ClientSession, query: str, count: int, **kwargs) -> List[ImageResult]:
@@ -354,16 +442,18 @@ async def search_serpapi(session: aiohttp.ClientSession, query: str, count: int,
 
 
 async def search_giphy(session: aiohttp.ClientSession, query: str, count: int, **kwargs) -> List[ImageResult]:
-    """GIF search via Giphy (free API key: https://developers.giphy.com/)."""
+    """GIF search via Giphy (free API key: https://developers.giphy.com/).
+    sort="trending" pulls Giphy's trending feed instead of searching (query is ignored in that mode)."""
     if not GIPHY_API_KEY:
         raise RuntimeError("GIPHY_API_KEY is not set.")
-    params = {
-        "api_key": GIPHY_API_KEY,
-        "q": query,
-        "limit": min(max(count, 1), 50),
-        "rating": "pg-13",
-    }
-    async with session.get("https://api.giphy.com/v1/gifs/search", params=params) as resp:
+    limit = min(max(count, 1), 50)
+    if kwargs.get("sort") == "trending":
+        url = "https://api.giphy.com/v1/gifs/trending"
+        params = {"api_key": GIPHY_API_KEY, "limit": limit, "rating": "pg-13"}
+    else:
+        url = "https://api.giphy.com/v1/gifs/search"
+        params = {"api_key": GIPHY_API_KEY, "q": query, "limit": limit, "rating": "pg-13"}
+    async with session.get(url, params=params) as resp:
         resp.raise_for_status()
         data = await resp.json()
     results = []
@@ -383,17 +473,19 @@ async def search_giphy(session: aiohttp.ClientSession, query: str, count: int, *
 
 
 async def search_tenor(session: aiohttp.ClientSession, query: str, count: int, **kwargs) -> List[ImageResult]:
-    """GIF search via Tenor (free Google API key: https://tenor.com/gifapi/documentation)."""
+    """GIF search via Tenor (free Google API key: https://tenor.com/gifapi/documentation).
+    sort="trending" pulls Tenor's featured/trending feed instead of searching (query is ignored in that mode)."""
     if not TENOR_API_KEY:
         raise RuntimeError("TENOR_API_KEY is not set.")
-    params = {
-        "key": TENOR_API_KEY,
-        "q": query,
-        "limit": min(max(count, 1), 50),
-        "media_filter": "gif",
-        "client_key": "telegram_photo_bot",
-    }
-    async with session.get("https://tenor.googleapis.com/v2/search", params=params) as resp:
+    limit = min(max(count, 1), 50)
+    common = {"key": TENOR_API_KEY, "limit": limit, "media_filter": "gif", "client_key": "telegram_photo_bot"}
+    if kwargs.get("sort") == "trending":
+        url = "https://tenor.googleapis.com/v2/featured"
+        params = common
+    else:
+        url = "https://tenor.googleapis.com/v2/search"
+        params = {**common, "q": query}
+    async with session.get(url, params=params) as resp:
         resp.raise_for_status()
         data = await resp.json()
     results = []
@@ -501,6 +593,24 @@ def chunk_by_size(paths: List[str], limit_bytes: int) -> List[List[str]]:
     return batches
 
 
+PHOTO_EXTS = {"jpg", "jpeg", "png", "webp"}
+
+
+async def send_single_file(context: ContextTypes.DEFAULT_TYPE, chat_id: int, path: str, caption: str):
+    """Send one downloaded file as its own message, picking the Telegram
+    send method that gives the best inline preview for its type: animated
+    playback for GIFs, an inline image for common photo formats, and a
+    plain document for anything else (bmp/tiff/svg/etc)."""
+    ext = path.rsplit(".", 1)[-1].lower()
+    with open(path, "rb") as f:
+        if ext == "gif":
+            await context.bot.send_animation(chat_id=chat_id, animation=f, caption=caption)
+        elif ext in PHOTO_EXTS:
+            await context.bot.send_photo(chat_id=chat_id, photo=f, caption=caption)
+        else:
+            await context.bot.send_document(chat_id=chat_id, document=f, caption=caption)
+
+
 # ---------------------------------------------------------------------------
 # Telegram handlers
 # ---------------------------------------------------------------------------
@@ -508,8 +618,10 @@ def chunk_by_size(paths: List[str], limit_bytes: int) -> List[List[str]]:
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Just send me a word or phrase and I'll show you 4 buttons — "
-        "Google, Stock photos, Safebooru (anime), and GIF — tap one (or "
-        "\"All of the above\") and I'll batch-download and zip the results.\n\n"
+        "Google, Stock photos, Safebooru (anime), and GIF. Tap one and I'll "
+        "walk you through sort order, count, resolution, and delivery "
+        "(zip or send individually) — or tap \"All of the above\" for a "
+        "quick run with defaults.\n\n"
         "For more control, use:\n"
         "/search <query> [count] [provider] [type:png|jpg|gif] [minscore:N]\n\n"
         "Examples:\n"
@@ -524,9 +636,20 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "*Quick mode*\n"
         "Type a word or phrase (no command) and I'll show 4 inline buttons — "
-        "Google, Stock, Safebooru, GIF — plus \"All of the above\". Tap one "
-        "and I'll run just that category's search; tap \"All\" to get all 4 "
-        "as separate zips.\n\n"
+        "Google, Stock, Safebooru, GIF.\n"
+        "• Tap *Safebooru* and I'll ask you to type part of the character "
+        "name — I look it up against Safebooru's own tag-autocomplete API "
+        "(the same one on their site) and show you real matching tags to "
+        "pick from, so you don't have to guess underscore formatting "
+        "yourself. Then you'll get sort options matching its own scoring "
+        "system: 🔥 Top (score), 🆕 New, 🎲 Random.\n"
+        "• Tap *Stock* or *GIF* and you'll get their own sort options "
+        "(Popular/Latest, Trending/Best match); *Google* skips straight to count.\n"
+        "• Every category then asks for count (5-30), minimum resolution "
+        "(Any / HD / Full HD), and delivery — 📦 one zip file, or 🖼 sent as "
+        "individual messages.\n"
+        "• Tap *All of the above* to skip the wizard and get all 4 "
+        "categories at once with default settings.\n\n"
         "*Full control*\n"
         "/search <query> [count] [provider] [type:png|jpg|gif] [minscore:N]\n"
         "  • count: 1-30 (web engines default 10-20, others default 10)\n"
@@ -534,11 +657,13 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  • type: keep only this file type — works for ANY provider, any image type "
         "(png/jpg/gif/webp/bmp/tiff/svg)\n"
         "  • minscore: (safebooru only) drop results below this score\n"
+        "  (/search always zips its results; use the button wizard for "
+        "individual-upload delivery or sort/resolution choices)\n"
         "/providers — list which providers have API keys configured\n\n"
         "*Stock photos* (pexels/pixabay/unsplash): filtered to landscape, "
-        f"≥{MIN_WIDTH_FOR_YOUTUBE}px wide.\n"
-        "*Anime art* (safebooru): character/tag search, safe-rated only, no key needed, "
-        "always sorted by score.\n"
+        f"≥{MIN_WIDTH_FOR_YOUTUBE}px wide by default.\n"
+        "*Anime art* (safebooru): exact character/tag search, safe-rated only, "
+        "no key needed.\n"
         "  e.g. `/search hatsune_miku 20 safebooru type:png minscore:80`\n"
         "*GIFs* (giphy/tenor): free API key each.\n"
         "  e.g. `/search excited cat 15 giphy`\n"
@@ -634,9 +759,13 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ---------------------------------------------------------------------------
-# Category-based search: a plain word/phrase gets 4 inline "glass" buttons
-# (google, stock, safebooru, gif) instead of running automatically. Tapping
-# one runs that category's search with whichever configured provider fits it.
+# Category-based search wizard: a plain word/phrase shows 4 inline "glass"
+# buttons (google, stock, safebooru, gif) plus "All of the above". Tapping a
+# single category walks through a short wizard -- for Safebooru specifically,
+# an exact-tag prompt first (its tag matching is strict, not natural
+# language), then sort, then count, then resolution, then delivery mode --
+# before running that one search. "All" skips the wizard and runs all
+# configured categories immediately with sensible defaults.
 # ---------------------------------------------------------------------------
 
 CATEGORY_PROVIDER_PRIORITY = {
@@ -652,23 +781,37 @@ CATEGORY_BUTTON_LABELS = {
     "safebooru": "🎌 Safebooru",
     "gif": "🎞 GIF",
 }
-PLAIN_TEXT_COUNT = 10  # per-category batch size when triggered via buttons
+PLAIN_TEXT_COUNT = 10  # default per-category batch size (overridden by the count step)
 
-# Pending queries waiting on a button tap: search_id -> (query, created_at).
-# callback_data has a 64-byte limit, so we pass a short id and look the
-# actual query text up here rather than cramming it into callback_data.
+# Sort options offered per category, as (button label, value) pairs. A
+# category with no entry here skips the sort step entirely (nothing
+# meaningful to choose between). Safebooru's options map to its own scoring
+# system (see SAFEBOORU_SORT_TAGS); stock/gif map to each API's own concept
+# of "order" -- see the sort= handling inside each search_* function.
+SORT_OPTIONS = {
+    "safebooru": [("🔥 Top (score)", "score"), ("🆕 New", "new"), ("🎲 Random", "random")],
+    "stock": [("🔥 Popular", "popular"), ("🆕 Latest", "latest")],
+    "gif": [("🔥 Trending", "trending"), ("🔍 Best match", "relevance")],
+}
+COUNT_OPTIONS = [5, 10, 15, 20, 30]
+SIZE_OPTIONS = [("Any size", "any"), ("HD (≥1280px)", "hd"), ("Full HD (≥1920px)", "fhd")]
+DELIVERY_OPTIONS = [("📦 Zip file", "zip"), ("🖼 Send individually", "individual")]
+
+# Pending searches waiting on the next button tap or text reply:
+# search_id -> dict(query, category, provider, sort, count, size, created).
+# callback_data has a 64-byte limit, so we pass a short id and keep the
+# actual state here rather than cramming it into callback_data.
 PENDING_SEARCHES: dict = {}
 PENDING_TTL_SECONDS = 30 * 60
 
 
-def _remember_query(query: str) -> str:
+def _new_pending(query: str) -> str:
     now = time.time()
-    # lazy cleanup of stale entries whenever we add a new one
-    stale = [k for k, (_, ts) in PENDING_SEARCHES.items() if now - ts > PENDING_TTL_SECONDS]
+    stale = [k for k, v in PENDING_SEARCHES.items() if now - v.get("created", 0) > PENDING_TTL_SECONDS]
     for k in stale:
         PENDING_SEARCHES.pop(k, None)
     search_id = uuid.uuid4().hex[:10]
-    PENDING_SEARCHES[search_id] = (query, now)
+    PENDING_SEARCHES[search_id] = {"query": query, "created": now}
     return search_id
 
 
@@ -685,11 +828,51 @@ def build_category_plan():
     return plan, missing
 
 
+def _wiz_kb(rows):
+    """rows: list of lists of (label, callback_data) -> InlineKeyboardMarkup."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=cd) for label, cd in row] for row in rows])
+
+
 async def handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """A plain message with no leading slash shows 4 inline buttons -- one
-    per category -- instead of searching immediately."""
-    query = (update.message.text or "").strip()
-    if not query:
+    """
+    A plain message with no leading slash normally shows the 4 category
+    buttons. The one exception: if this chat is mid-wizard waiting on a
+    Safebooru tag (after tapping the Safebooru button), this message is
+    looked up against Safebooru's own tag-autocomplete API instead of being
+    used as the tag verbatim.
+    """
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+
+    awaiting_id = context.chat_data.get("awaiting_safebooru_tag")
+    if awaiting_id:
+        context.chat_data.pop("awaiting_safebooru_tag", None)
+        entry = PENDING_SEARCHES.get(awaiting_id)
+        if not entry:
+            return
+
+        typed_fallback = text if "," in text else text.replace(" ", "_")
+        suggestions = await safebooru_autocomplete(text)
+
+        if suggestions:
+            entry["tag_suggestions"] = suggestions
+            entry["typed_fallback"] = typed_fallback
+            rows = [[(f"🏷 {tag}", f"wz|tagpick|{i}|{awaiting_id}")] for i, tag in enumerate(suggestions)]
+            rows.append([(f"✅ Use “{typed_fallback}” as typed", f"wz|tagpick|-1|{awaiting_id}")])
+            await update.message.reply_text(
+                f"Safebooru tags matching “{text}”:", reply_markup=_wiz_kb(rows)
+            )
+        else:
+            entry["query"] = typed_fallback
+            keyboard = _wiz_kb([[
+                (label, f"wz|sort|{val}|{awaiting_id}") for label, val in SORT_OPTIONS["safebooru"]
+            ]])
+            await update.message.reply_text(
+                f"No Safebooru tag matches for “{text}” — using it as-is: "
+                f"“{typed_fallback}”. Sort by:",
+                reply_markup=keyboard,
+            )
         return
 
     plan, missing = build_category_plan()
@@ -699,61 +882,122 @@ async def handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    search_id = _remember_query(query)
-
-    row = [
-        InlineKeyboardButton(CATEGORY_BUTTON_LABELS[cat], callback_data=f"srch|{cat}|{search_id}")
-        for cat, _ in plan
-    ]
-    keyboard = [row[i:i + 2] for i in range(0, len(row), 2)]  # 2 buttons per row
+    search_id = _new_pending(text)
+    row = [(CATEGORY_BUTTON_LABELS[cat], f"wz|cat|{cat}|{search_id}") for cat, _ in plan]
+    rows = [row[i:i + 2] for i in range(0, len(row), 2)]  # 2 buttons per row
     if len(plan) > 1:
-        keyboard.append([InlineKeyboardButton("📦 All of the above", callback_data=f"srch|all|{search_id}")])
+        rows.append([("📦 All of the above", f"wz|cat|all|{search_id}")])
 
-    text = f"What would you like for “{query}”?"
+    msg = f"What would you like for “{text}”?"
     if missing:
-        text += f"\n(not shown: {', '.join(missing)} — no API key configured)"
+        msg += f"\n(not shown: {', '.join(missing)} — no API key configured)"
 
-    await update.message.reply_text(text, reply_markup=InlineKeyboardMarkup(keyboard))
+    await update.message.reply_text(msg, reply_markup=_wiz_kb(rows))
 
 
-async def handle_category_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_wizard_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cb = update.callback_query
     await cb.answer()
 
     parts = (cb.data or "").split("|")
-    if len(parts) != 3 or parts[0] != "srch":
+    if len(parts) != 4 or parts[0] != "wz":
         return
-    _, category, search_id = parts
+    _, step, value, search_id = parts
 
     entry = PENDING_SEARCHES.get(search_id)
     if not entry:
         await cb.edit_message_text("This search has expired — just send the word again.")
         return
-    query, _ = entry
-
-    plan, _ = build_category_plan()
-    plan_dict = dict(plan)
     chat_id = cb.message.chat.id
+    query = entry["query"]
 
-    if category == "all":
-        await cb.edit_message_text(f"🔎 Searching {', '.join(c for c, _ in plan)} for “{query}”…")
+    if step == "cat":
+        plan, _ = build_category_plan()
+        plan_dict = dict(plan)
 
-        async def run_one(cat: str, provider: str):
-            status_msg = await context.bot.send_message(chat_id=chat_id, text=f"[{cat}] starting…")
-            await run_search_job(context, chat_id, query, PLAIN_TEXT_COUNT, provider, {}, status_msg, label=cat)
+        if value == "all":
+            await cb.edit_message_text(f"🔎 Searching {', '.join(c for c, _ in plan)} for “{query}”…")
 
-        await asyncio.gather(*[run_one(cat, provider) for cat, provider in plan])
+            async def run_one(cat: str, provider: str):
+                status_msg = await context.bot.send_message(chat_id=chat_id, text=f"[{cat}] starting…")
+                await run_search_job(context, chat_id, query, PLAIN_TEXT_COUNT, provider, {}, status_msg, label=cat)
+
+            await asyncio.gather(*[run_one(cat, provider) for cat, provider in plan])
+            PENDING_SEARCHES.pop(search_id, None)
+            return
+
+        provider = plan_dict.get(value)
+        if not provider:
+            await cb.edit_message_text(f"'{value}' isn't configured anymore. Try another option or /providers.")
+            return
+        entry["category"] = value
+        entry["provider"] = provider
+
+        if value == "safebooru":
+            # Safebooru's tag matching is strict/literal (no natural-language
+            # fuzzy matching), so look up real tags via its own autocomplete
+            # API before running anything.
+            context.chat_data["awaiting_safebooru_tag"] = search_id
+            await cb.edit_message_text(
+                f"Type part of the character name or tag — I'll look it up "
+                f"against Safebooru's own tag list (you searched “{query}”)."
+            )
+            return
+
+        if value in SORT_OPTIONS:
+            keyboard = _wiz_kb([[(label, f"wz|sort|{val}|{search_id}") for label, val in SORT_OPTIONS[value]]])
+            await cb.edit_message_text(f"[{value}] Sort by:", reply_markup=keyboard)
+        else:
+            # no sort concept for this category (e.g. google/serpapi) -- skip to count
+            entry["sort"] = "relevance"
+            keyboard = _wiz_kb([[(str(n), f"wz|count|{n}|{search_id}") for n in COUNT_OPTIONS]])
+            await cb.edit_message_text(f"[{value}] How many results?", reply_markup=keyboard)
+        return
+
+    if step == "tagpick":
+        idx = int(value)
+        suggestions = entry.get("tag_suggestions", [])
+        if idx == -1 or not (0 <= idx < len(suggestions)):
+            chosen_tag = entry.get("typed_fallback", query)
+        else:
+            chosen_tag = suggestions[idx]
+        entry["query"] = chosen_tag
+        query = chosen_tag
+        keyboard = _wiz_kb([[(label, f"wz|sort|{val}|{search_id}") for label, val in SORT_OPTIONS["safebooru"]]])
+        await cb.edit_message_text(f"Tag: “{chosen_tag}”. Sort by:", reply_markup=keyboard)
+        return
+
+    if step == "sort":
+        entry["sort"] = value
+        keyboard = _wiz_kb([[(str(n), f"wz|count|{n}|{search_id}") for n in COUNT_OPTIONS]])
+        await cb.edit_message_text(f"[{entry['category']}] How many results?", reply_markup=keyboard)
+        return
+
+    if step == "count":
+        entry["count"] = int(value)
+        keyboard = _wiz_kb([[(label, f"wz|size|{val}|{search_id}") for label, val in SIZE_OPTIONS]])
+        await cb.edit_message_text(f"[{entry['category']}] Minimum resolution?", reply_markup=keyboard)
+        return
+
+    if step == "size":
+        entry["size"] = value
+        keyboard = _wiz_kb([[(label, f"wz|deliver|{val}|{search_id}") for label, val in DELIVERY_OPTIONS]])
+        await cb.edit_message_text(f"[{entry['category']}] Deliver as:", reply_markup=keyboard)
+        return
+
+    if step == "deliver":
+        category = entry["category"]
+        provider = entry["provider"]
+        extra = {"sort": entry.get("sort"), "size": entry.get("size", "any")}
+        count = entry.get("count", PLAIN_TEXT_COUNT)
+
+        status_msg = await cb.edit_message_text(f"[{category}] 🔎 Searching for “{query}”…")
+        await run_search_job(
+            context, chat_id, query, count, provider, extra, status_msg,
+            label=category, delivery=value,
+        )
         PENDING_SEARCHES.pop(search_id, None)
         return
-
-    provider = plan_dict.get(category)
-    if not provider:
-        await cb.edit_message_text(f"'{category}' isn't configured anymore. Try another option or /providers.")
-        return
-
-    status_msg = await cb.edit_message_text(f"[{category}] 🔎 Searching for “{query}”…")
-    await run_search_job(context, chat_id, query, PLAIN_TEXT_COUNT, provider, {}, status_msg, label=category)
-    PENDING_SEARCHES.pop(search_id, None)
 
 
 async def run_search_job(
@@ -765,17 +1009,19 @@ async def run_search_job(
     extra: dict,
     status_msg,
     label: Optional[str] = None,
+    delivery: str = "zip",
 ):
     """
-    Core search -> download -> zip -> send pipeline, shared by /search and
-    the plain-text multi-category handler. Each call gets its own uniquely
-    named job directory (chat id + provider/label + uuid) so concurrent
-    jobs for the same chat can never collide or clean up each other's files
+    Core search -> download -> (zip or send individually) pipeline, shared
+    by /search and the button wizard. Each call gets its own uniquely named
+    job directory (chat id + provider/label + uuid) so concurrent jobs for
+    the same chat can never collide or clean up each other's files
     mid-download/zip -- that collision was the cause of jobs silently
     stalling at the zipping step.
     """
     label = label or provider
     file_type = extra.get("file_type")
+    size = extra.get("size") or ("hd" if provider not in SKIP_ORIENTATION_FILTER else "any")
     job_dir = os.path.join(
         WORKDIR, f"job_{chat_id}_{label}_{uuid.uuid4().hex}"
     )
@@ -802,12 +1048,10 @@ async def run_search_job(
                 else:
                     typed = [r for r in raw_results if matches_file_type(r, file_type)]
 
-                if provider in SKIP_ORIENTATION_FILTER:
+                require_landscape = provider not in SKIP_ORIENTATION_FILTER
+                filtered = [r for r in typed if passes_size_filter(r, size, require_landscape)]
+                if not filtered:
                     filtered = typed
-                else:
-                    filtered = [r for r in typed if is_youtube_friendly(r)]
-                    if not filtered:
-                        filtered = typed
 
                 chosen = filtered[: (count * 3 if needs_post_filter else count)]
 
@@ -844,6 +1088,20 @@ async def run_search_job(
                 await status_msg.edit_text(msg + " Try a different query or provider.")
                 return
 
+            safe_query = re.sub(r"[^a-zA-Z0-9]+", "_", query)[:30]
+
+            if delivery == "individual":
+                await status_msg.edit_text(f"[{label}] 🖼 Sending {len(paths)} files…")
+                sent = 0
+                for i, path in enumerate(paths, start=1):
+                    try:
+                        await send_single_file(context, chat_id, path, caption=f"[{label}] {i}/{len(paths)} “{query}”")
+                        sent += 1
+                    except Exception:
+                        logger.exception("[%s/%s] failed to send %s individually", label, provider, path)
+                await status_msg.edit_text(f"[{label}] ✅ Done — sent {sent}/{len(paths)} files.")
+                return
+
             await status_msg.edit_text(f"[{label}] 📦 Zipping {len(paths)} files…")
 
             zip_path = os.path.join(job_dir, "files.zip")
@@ -853,8 +1111,6 @@ async def run_search_job(
                 logger.exception("[%s/%s] zipping failed (job_dir=%s)", label, provider, job_dir)
                 await status_msg.edit_text(f"[{label}] ⚠️ Failed while zipping the downloaded files.")
                 return
-
-            safe_query = re.sub(r"[^a-zA-Z0-9]+", "_", query)[:30]
 
             if os.path.getsize(zip_path) <= TELEGRAM_DOC_SIZE_LIMIT:
                 with open(zip_path, "rb") as f:
@@ -934,7 +1190,7 @@ def main():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("providers", providers_cmd))
     app.add_handler(CommandHandler("search", search_cmd))
-    app.add_handler(CallbackQueryHandler(handle_category_button, pattern=r"^srch\|"))
+    app.add_handler(CallbackQueryHandler(handle_wizard_button, pattern=r"^wz\|"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_plain_text))
 
     logger.info("Bot starting… configured providers: %s", configured_providers())

@@ -22,11 +22,31 @@ cat wearing sunglasses
 
 ...and the bot replies with 4 inline "glass" buttons — **Google**,
 **Stock photos**, **Safebooru**, **GIF** — plus **All of the above**.
-Tap one to run just that category's search, or tap "All" to get all 4
-as separate zips. Categories with no API key configured simply don't
-get a button (and the message tells you which ones were skipped).
 
-For more control, use `/search` directly:
+- Tap **Safebooru** and the bot asks you to type part of the
+  character name or tag. It looks that up against **Safebooru's own
+  tag-autocomplete API** (`autocomplete.php` — the same endpoint that
+  backs the search box on safebooru.org) and shows you real, existing
+  tags to pick from, instead of you having to guess exact underscore
+  formatting yourself. If nothing matches, it falls back to using your
+  text as-is. After picking a tag, you get sort options matching
+  Safebooru's own scoring system: 🔥 **Top (score)**, 🆕 **New**,
+  🎲 **Random**.
+- Tap **Stock** or **GIF** and you get their own sort options
+  (Popular/Latest for stock; Trending/Best match for GIFs).
+  **Google** has no sort concept and skips straight to the next step.
+- Every category then walks through: **count** (5/10/15/20/30),
+  **minimum resolution** (Any / HD ≥1280px / Full HD ≥1920px), and
+  **delivery** — 📦 one zip file, or 🖼 sent as individual messages
+  (photos inline, GIFs as animations, anything else as a document).
+- Tap **All of the above** to skip the wizard entirely and get all 4
+  categories at once with default settings (top/relevance sort, 10
+  results, any resolution, zipped).
+
+Categories with no API key configured simply don't get a button (the
+message tells you which ones were skipped).
+
+For full one-line control, use `/search` directly:
 
 ```
 /search drone shot of a forest
@@ -41,8 +61,8 @@ For more control, use `/search` directly:
 
 - `count` (optional): how many files to fetch. Web engines
   (`google`/`serpapi`) default to **15** if omitted (the 10-20 range);
-  other providers default to 10. Max 30. The button-triggered
-  category searches use 10 per category.
+  other providers default to 10. Max 30. The button wizard lets you
+  pick 5/10/15/20/30 explicitly per search.
 - `provider` (optional): `pexels`, `pixabay`, `unsplash`, `safebooru`,
   `giphy`, `tenor`, `google`, or `serpapi`. Defaults to whatever
   `DEFAULT_PROVIDER` is set to in `.env`.
