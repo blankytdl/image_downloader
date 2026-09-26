@@ -149,17 +149,54 @@ it skipped.
 ### Google Custom Search (free "google" option)
 1. Create a Programmable Search Engine at
    https://programmablesearchengine.google.com/ — click "Add",
-   give it any name, and for "What to search" choose "Search the
-   entire web".
-2. Open the new engine's settings and turn **"Image search"** ON.
-3. Copy the **Search engine ID** (also called `cx`) from the setup
+   give it any name.
+2. For **"What to search"**, don't choose "Search the entire web" —
+   for an anime/YouTube channel bot you'll get much more relevant,
+   on-topic results (and fewer random stock-photo/unrelated hits) by
+   scoping the engine to a curated list of anime/manga/fan-art sites
+   instead. Choose "Search specific sites or pages" and add roughly
+   15–20 of these to start (Google's docs note that engines with more
+   than ~20 sites can sometimes return fewer/less complete results, so
+   don't dump all 50 slots in at once):
+
+   ```text
+   aniplex.co.jp/*
+   crunchyroll.com/*
+   animenewsnetwork.com/*
+   myanimelist.net/*
+   anilist.co/*
+   anime-planet.com/*
+   fandom.com/*
+   *.fandom.com/*
+   wikipedia.org/*
+   *.wikipedia.org/*
+   wikimedia.org/*
+   *.wikimedia.org/*
+   pixiv.net/*
+   *.pixiv.net/*
+   deviantart.com/*
+   *.deviantart.com/*
+   artstation.com/*
+   reddit.com/*
+   *.reddit.com/*
+   imgur.com/*
+   ```
+
+   You can add/remove sites later from the engine's **Sites** tab
+   (up to 50 distinct domains total) without needing new API keys.
+3. Open the new engine's settings and turn **"Image search"** ON.
+4. Copy the **Search engine ID** (also called `cx`) from the setup
    page — put it in `GOOGLE_CSE_ENGINE_ID`.
-4. Get an API key for the Custom Search JSON API at
+5. Get an API key for the Custom Search JSON API at
    https://developers.google.com/custom-search/v1/introduction —
    click "Get a Key", create/select a Google Cloud project, and copy
    the generated key into `GOOGLE_CSE_API_KEY`.
-5. Free tier: 100 queries/day; billing can be enabled on the same
+6. Free tier: 100 queries/day; billing can be enabled on the same
    Cloud project for more, at $5 per 1,000 queries.
+
+Both `GOOGLE_CSE_API_KEY` and `GOOGLE_CSE_ENGINE_ID` are already
+listed in `.env.example` — no new environment variables are needed
+for this.
 
 ### SerpApi (paid "google" option, real Google Images)
 1. Sign up at https://serpapi.com/ (a small number of free searches

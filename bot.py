@@ -113,6 +113,8 @@ class ImageResult:
     source: str        # provider name, used for the filename prefix
     ident: str          # provider-side id, used for the filename
     score: Optional[int] = None       # booru-style score, None for stock providers
+    thumbnail_url: Optional[str] = None  # small preview image, when the provider gives one
+    source_page: Optional[str] = None    # page the image was found on, when the provider gives one
 
 
 SIZE_THRESHOLDS = {"any": 0, "hd": 1280, "fhd": 1920}
@@ -402,6 +404,8 @@ async def search_google_cse(session: aiohttp.ClientSession, query: str, count: i
                 height=img_meta.get("height", 0),
                 source="google",
                 ident=f"{start}_{i}",
+                thumbnail_url=img_meta.get("thumbnailLink"),
+                source_page=img_meta.get("contextLink"),
             ))
         if len(results) >= count:
             break
@@ -559,6 +563,14 @@ async def download_one(session: aiohttp.ClientSession, img: ImageResult, dest_di
                 resp.raise_for_status()
                 content = await resp.read()
                 content_type = resp.headers.get("Content-Type", "")
+
+            # Web-search-derived links (google/serpapi) occasionally resolve to
+            # an HTML page instead of the actual image (dead link, hotlink
+            # protection, a redirect to a viewer page, etc). Catch the obvious
+            # case so we don't save/send a webpage as if it were a photo.
+            if img.source in ("google", "serpapi") and "html" in content_type.lower():
+                logger.warning("Skipping non-image response for %s (Content-Type: %s)", img.url, content_type)
+                return None
 
             ext = url_extension(img.url) or ext_from_content_type(content_type) or "jpg"
             filename = f"{img.source}_{img.ident}.{ext}"
@@ -774,6 +786,11 @@ CATEGORY_PROVIDER_PRIORITY = {
     "safebooru": ["safebooru"],
     "gif": ["giphy", "tenor"],
 }
+# Pexels' search endpoint has no date/"latest" ordering parameter at all, so
+# picking "🆕 Latest" while Pexels is the resolved stock provider would
+# silently do nothing (still relevance-ordered). These are the stock
+# providers that DO support it -- used to re-route the pick, below.
+STOCK_PROVIDERS_SUPPORTING_LATEST = ("pixabay", "unsplash")
 CATEGORY_ORDER = ["google", "stock", "safebooru", "gif"]
 CATEGORY_BUTTON_LABELS = {
     "google": "🔎 Google",
@@ -969,8 +986,15 @@ async def handle_wizard_button(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if step == "sort":
         entry["sort"] = value
+        note = ""
+        if entry["category"] == "stock" and value == "latest" and entry.get("provider") == "pexels":
+            avail_providers = set(configured_providers())
+            fallback = next((p for p in STOCK_PROVIDERS_SUPPORTING_LATEST if p in avail_providers), None)
+            if fallback:
+                entry["provider"] = fallback
+                note = f" (using {fallback} -- Pexels has no \"latest\" ordering)"
         keyboard = _wiz_kb([[(str(n), f"wz|count|{n}|{search_id}") for n in COUNT_OPTIONS]])
-        await cb.edit_message_text(f"[{entry['category']}] How many results?", reply_markup=keyboard)
+        await cb.edit_message_text(f"[{entry['category']}] How many results?{note}", reply_markup=keyboard)
         return
 
     if step == "count":
@@ -1028,7 +1052,12 @@ async def run_search_job(
     os.makedirs(job_dir, exist_ok=True)
 
     try:
-        job_timeout = 20 + count * 8  # scales with batch size; generous but finite
+        # google/serpapi + a type: filter over-fetches (up to 3x) and downloads
+        # every candidate before filtering by real sniffed type, so pad the
+        # timeout for that case instead of sizing it off the requested count.
+        needs_post_filter_estimate = bool(file_type) and provider in WEB_ENGINE_PROVIDERS
+        effective_count = count * 3 if needs_post_filter_estimate else count
+        job_timeout = 20 + effective_count * 8  # scales with batch size; generous but finite
 
         async def _do_job():
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT)) as session:
