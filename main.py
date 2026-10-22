@@ -1444,6 +1444,9 @@ def main():
         configured_providers(),
     )
 
+    # Python 3.14 no longer creates a main-thread event loop implicitly.
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     app.run_polling()
 
 
