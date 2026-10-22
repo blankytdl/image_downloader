@@ -1,3 +1,4 @@
-python-telegram-bot>=20,<23
+python-telegram-bot>=21.10,<22
 aiohttp>=3.9
 python-dotenv>=1.0
+Pillow>=10.0

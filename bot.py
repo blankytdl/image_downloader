@@ -22,7 +22,7 @@ Usage inside Telegram, once the bot is running:
     /providers            -> lists which providers are configured
     /help
 
-Requirements: python-telegram-bot>=20, aiohttp, python-dotenv
+Requirements: python-telegram-bot>=21.10,<22, aiohttp, python-dotenv
 See requirements.txt and README.md.
 """
 
@@ -42,6 +42,7 @@ from typing import List, Optional
 
 import aiohttp
 from dotenv import load_dotenv
+from PIL import Image, ImageDraw
 from telegram import Update, InputMediaPhoto, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -74,6 +75,7 @@ GOOGLE_CSE_ENGINE_ID = os.getenv("GOOGLE_CSE_ENGINE_ID", "")
 SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")           # paid, real Google Images results
 GIPHY_API_KEY = os.getenv("GIPHY_API_KEY", "")
 TENOR_API_KEY = os.getenv("TENOR_API_KEY", "")
+FREESOUND_API_KEY = os.getenv("FREESOUND_API_KEY", "")
 
 DEFAULT_PROVIDER = os.getenv("DEFAULT_PROVIDER", "pexels").lower()
 DEFAULT_COUNT = 10
@@ -81,8 +83,19 @@ WEB_ENGINE_DEFAULT_COUNT = 15      # google/serpapi default to 10-20 range when 
 MAX_COUNT = 30                     # hard cap per /search call
 MIN_WIDTH_FOR_YOUTUBE = 1280       # HD-ish minimum
 CONCURRENT_DOWNLOADS = 6
+# Process-wide cap on simultaneous downloads across ALL jobs/chats -- without
+# this, e.g. "All of the above" (4 categories at once) or several users
+# searching at the same moment could stack up 6 concurrent downloads *per
+# job* with no shared ceiling. Configurable since containers vary in size.
+GLOBAL_CONCURRENT_DOWNLOADS = int(os.getenv("GLOBAL_CONCURRENT_DOWNLOADS", "12"))
+GLOBAL_DOWNLOAD_SEMAPHORE = asyncio.Semaphore(GLOBAL_CONCURRENT_DOWNLOADS)
+DOWNLOAD_CHUNK_BYTES = 64 * 1024   # streamed to disk, never buffered whole in RAM
+MAX_DOWNLOAD_BYTES = 100 * 1024 * 1024  # safety cap against a single runaway file
 TELEGRAM_DOC_SIZE_LIMIT = 45 * 1024 * 1024  # keep under the 50MB API cap
 DOWNLOAD_TIMEOUT = 30
+# Some sites (Danbooru/Cloudflare-fronted boorus, image CDNs) reject or throttle the
+# bare default aiohttp User-Agent, so every session identifies itself.
+HTTP_HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; AnimeYouTubeImageBot/1.0)"}
 
 # Providers where the search result URL doesn't reliably carry a file
 # extension (arbitrary web pages), so we over-fetch candidates and sniff
@@ -99,7 +112,14 @@ CONTENT_TYPE_TO_EXT = {
     "image/tiff": "tiff",
     "image/svg+xml": "svg",
     "image/x-icon": "ico",
+    "audio/mpeg": "mp3",
+    "audio/mp3": "mp3",
+    "audio/wav": "wav",
+    "audio/x-wav": "wav",
+    "audio/ogg": "ogg",
+    "audio/flac": "flac",
 }
+AUDIO_EXTS = {"mp3", "wav", "ogg", "flac", "m4a"}
 
 WORKDIR = os.path.join(tempfile.gettempdir(), "photo_bot_jobs")
 os.makedirs(WORKDIR, exist_ok=True)
@@ -146,7 +166,8 @@ def is_youtube_friendly(img: ImageResult) -> bool:
 
 def url_extension(url: str) -> str:
     lower = url.lower().split("?")[0]
-    for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".svg"):
+    for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".svg",
+                ".mp3", ".wav", ".ogg", ".flac", ".m4a"):
         if lower.endswith(ext):
             return ext.lstrip(".")
     return ""
@@ -275,20 +296,28 @@ async def search_safebooru(session: aiohttp.ClientSession, query: str, count: in
     tags.append(SAFEBOORU_SORT_TAGS.get(sort_choice, SAFEBOORU_SORT_TAGS["score"]))
     tag_string = " ".join(tags)
 
-    params = {
-        "page": "dapi",
-        "s": "post",
-        "q": "index",
-        "json": "1",
-        "limit": max(min(count * 3, 100), 10),
-        "tags": tag_string,
-    }
-    async with session.get("https://safebooru.org/index.php", params=params) as resp:
-        resp.raise_for_status()
-        try:
-            data = await resp.json(content_type=None)
-        except Exception:
-            data = []
+    async def _fetch(tag_str: str):
+        params = {
+            "page": "dapi",
+            "s": "post",
+            "q": "index",
+            "json": "1",
+            "limit": max(min(count * 3, 100), 10),
+            "tags": tag_str,
+        }
+        async with session.get("https://safebooru.org/index.php", params=params) as resp:
+            resp.raise_for_status()
+            try:
+                return await resp.json(content_type=None)
+            except Exception:
+                return []
+
+    data = await _fetch(tag_string)
+    if not data and raw_tags:
+        # If the server-side sort: meta-tag is what tripped the query up,
+        # retry once with just the plain tag(s); ordering is then done
+        # client-side below instead of failing with a false "no results".
+        data = await _fetch(" ".join(t.replace(" ", "_") for t in raw_tags))
 
     results = []
     for post in data or []:
@@ -333,7 +362,7 @@ async def safebooru_autocomplete(partial: str, limit: int = 8) -> List[str]:
     """
     try:
         timeout = aiohttp.ClientTimeout(total=10)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with aiohttp.ClientSession(timeout=timeout, headers=HTTP_HEADERS) as session:
             async with session.get(
                 "https://safebooru.org/autocomplete.php", params={"q": partial}
             ) as resp:
@@ -367,6 +396,246 @@ async def safebooru_autocomplete(partial: str, limit: int = 8) -> List[str]:
             seen.add(t)
             deduped.append(t)
     return deduped[:limit]
+
+
+# Yande.re and Konachan both run the "Moebooru" board software (a different
+# codebase/API family from Safebooru's Gelbooru-style API), and share an
+# identical API shape, so one implementation backs both. Unlike Safebooru --
+# which is a safe-rated-only mirror by design -- these two ARE general
+# boorus that also host non-safe-rated content, so "rating:safe" is always
+# force-appended to every query below (plus a client-side re-check on the
+# response) and there is no way to override that from the wizard or /search.
+MOEBOORU_SORT_TAGS = {
+    "score": "order:score",   # top / most popular (default)
+    "new": "order:date",      # most recently posted
+    "random": "order:random", # random pick
+}
+
+
+async def _moebooru_search(base_url: str, source: str, session: aiohttp.ClientSession,
+                            query: str, count: int, **kwargs) -> List[ImageResult]:
+    min_score = int(kwargs.get("minscore", 0) or 0)
+    sort_choice = kwargs.get("sort", "score")
+
+    raw_tags = [t.strip() for t in re.split(r"[,\n]", query) if t.strip()]
+    tags = [t.replace(" ", "_") for t in raw_tags] if raw_tags else []
+    tags.append("rating:safe")  # not user-overridable -- see module note above
+    tags.append(MOEBOORU_SORT_TAGS.get(sort_choice, MOEBOORU_SORT_TAGS["score"]))
+    tag_string = " ".join(tags)
+
+    params = {"tags": tag_string, "limit": max(min(count * 3, 100), 10)}
+    async with session.get(f"{base_url}/post.json", params=params) as resp:
+        resp.raise_for_status()
+        try:
+            data = await resp.json(content_type=None)
+        except Exception:
+            data = []
+
+    results = []
+    for post in data or []:
+        if post.get("rating") not in (None, "s"):
+            continue  # belt-and-suspenders on top of the rating:safe tag above
+        score = int(post.get("score") or 0)
+        if score < min_score:
+            continue
+        file_url = post.get("file_url")
+        if not file_url:
+            continue
+        results.append(ImageResult(
+            url=file_url,
+            width=int(post.get("width") or 0),
+            height=int(post.get("height") or 0),
+            source=source,
+            ident=str(post.get("id")),
+            score=score,
+        ))
+
+    if sort_choice == "score":
+        results.sort(key=lambda r: r.score or 0, reverse=True)
+    return results
+
+
+async def search_yandere(session: aiohttp.ClientSession, query: str, count: int, **kwargs) -> List[ImageResult]:
+    """Yande.re -- anime art/screenshots, safe-rated results only (forced), no API key required."""
+    return await _moebooru_search("https://yande.re", "yandere", session, query, count, **kwargs)
+
+
+async def search_konachan(session: aiohttp.ClientSession, query: str, count: int, **kwargs) -> List[ImageResult]:
+    """Konachan -- anime art/wallpapers, safe-rated results only (forced), no API key required."""
+    return await _moebooru_search("https://konachan.com", "konachan", session, query, count, **kwargs)
+
+
+async def _moebooru_autocomplete(base_url: str, partial: str, limit: int = 8) -> List[str]:
+    """Shared tag-autocomplete for both Moebooru sites, mirroring safebooru_autocomplete's contract."""
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout, headers=HTTP_HEADERS) as session:
+            async with session.get(
+                f"{base_url}/tag.json",
+                params={"name_pattern": f"*{partial}*", "limit": limit, "order": "count"},
+            ) as resp:
+                resp.raise_for_status()
+                try:
+                    data = await resp.json(content_type=None)
+                except Exception:
+                    data = []
+    except Exception:
+        logger.warning("Moebooru autocomplete request failed for %r (%s)", partial, base_url, exc_info=True)
+        return []
+
+    tags: List[str] = []
+    for item in data or []:
+        name = (item or {}).get("name") if isinstance(item, dict) else None
+        if name:
+            tags.append(name)
+
+    seen = set()
+    deduped = []
+    for t in tags:
+        if t not in seen:
+            seen.add(t)
+            deduped.append(t)
+    return deduped[:limit]
+
+
+async def yandere_autocomplete(partial: str, limit: int = 8) -> List[str]:
+    return await _moebooru_autocomplete("https://yande.re", partial, limit)
+
+
+async def konachan_autocomplete(partial: str, limit: int = 8) -> List[str]:
+    return await _moebooru_autocomplete("https://konachan.com", partial, limit)
+
+
+# safebooru.donmai.us is Danbooru's own official safe-rated mirror (a
+# different site from safebooru.org) running the real Danbooru API, with much
+# broader character/tag coverage. Anonymous Danbooru access is capped at 2
+# search tags per query, so exactly one user tag + "rating:g" (General, the
+# strictest tier -- not "sensitive") is used; sorting is done via params /
+# client-side rather than order: meta-tags to stay under that cap. As with
+# the other boorus, the safe rating is forced and re-checked client-side.
+async def search_danbooru_safe(session: aiohttp.ClientSession, query: str, count: int, **kwargs) -> List[ImageResult]:
+    min_score = int(kwargs.get("minscore", 0) or 0)
+    sort_choice = kwargs.get("sort", "score")
+
+    raw_tags = [t.strip() for t in re.split(r"[,\n]", query) if t.strip()]
+    user_tag = raw_tags[0].replace(" ", "_") if raw_tags else ""
+    tags = " ".join(t for t in (user_tag, "rating:g") if t)
+
+    params = {"tags": tags, "limit": max(min(count * 3, 100), 10)}
+    if sort_choice == "random":
+        params["random"] = "true"
+    async with session.get("https://safebooru.donmai.us/posts.json", params=params) as resp:
+        resp.raise_for_status()
+        try:
+            data = await resp.json(content_type=None)
+        except Exception:
+            data = []
+
+    results = []
+    for post in data or []:
+        if not isinstance(post, dict) or post.get("rating") not in (None, "g"):
+            continue
+        score = int(post.get("score") or 0)
+        if score < min_score:
+            continue
+        file_url = post.get("file_url") or post.get("large_file_url")
+        if not file_url:
+            continue
+        results.append(ImageResult(
+            url=file_url,
+            width=int(post.get("image_width") or 0),
+            height=int(post.get("image_height") or 0),
+            source="danbooru",
+            ident=str(post.get("id")),
+            score=score,
+            thumbnail_url=post.get("preview_file_url"),
+        ))
+
+    if sort_choice == "score":
+        results.sort(key=lambda r: r.score or 0, reverse=True)
+    return results
+
+
+async def danbooru_safe_autocomplete(partial: str, limit: int = 8) -> List[str]:
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout, headers=HTTP_HEADERS) as session:
+            async with session.get(
+                "https://safebooru.donmai.us/tags.json",
+                params={"search[name_matches]": f"*{partial}*", "search[order]": "count", "limit": limit},
+            ) as resp:
+                resp.raise_for_status()
+                try:
+                    data = await resp.json(content_type=None)
+                except Exception:
+                    data = []
+    except Exception:
+        logger.warning("Danbooru autocomplete request failed for %r", partial, exc_info=True)
+        return []
+    names = []
+    for item in data or []:
+        if isinstance(item, dict) and item.get("name") and int(item.get("post_count") or 0) > 0:
+            names.append(item["name"])
+    return names[:limit]
+
+
+# Waifu.im is a curated anime-art API organised around a fixed list of
+# category tags (waifu, maid, ...) rather than free-text character search, so
+# "autocomplete" here means matching what the user typed against that list.
+# is_nsfw=false is always sent explicitly (never relying on the default) and
+# only the SFW ("versatile") tag list is ever offered as suggestions.
+async def search_waifu_im(session: aiohttp.ClientSession, query: str, count: int, **kwargs) -> List[ImageResult]:
+    sort_choice = kwargs.get("sort", "favorites")
+    tag = re.split(r"[,\n]", query)[0].strip().replace(" ", "-").replace("_", "-").lower()
+    params = {"is_nsfw": "false", "many": "true"}
+    if tag:
+        params["included_tags"] = tag
+    if sort_choice == "favorites":
+        params["order_by"] = "FAVORITES"
+    async with session.get("https://api.waifu.im/search", params=params) as resp:
+        resp.raise_for_status()
+        try:
+            data = await resp.json(content_type=None)
+        except Exception:
+            data = {}
+
+    items = data.get("images") or data.get("items") or [] if isinstance(data, dict) else []
+    results = []
+    for item in items:
+        if not isinstance(item, dict) or item.get("is_nsfw"):
+            continue
+        url = item.get("url")
+        if not url:
+            continue
+        results.append(ImageResult(
+            url=url,
+            width=int(item.get("width") or 0),
+            height=int(item.get("height") or 0),
+            source="waifuim",
+            ident=str(item.get("image_id") or item.get("id") or len(results)),
+            score=int(item.get("favorites") or 0),
+        ))
+    return results[:max(count, 1) * 3]
+
+
+async def waifu_im_autocomplete(partial: str, limit: int = 8) -> List[str]:
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout, headers=HTTP_HEADERS) as session:
+            async with session.get("https://api.waifu.im/tags") as resp:
+                resp.raise_for_status()
+                data = await resp.json(content_type=None)
+    except Exception:
+        logger.warning("Waifu.im tag list request failed", exc_info=True)
+        return []
+    sfw = data.get("versatile", []) if isinstance(data, dict) else []
+    names = []
+    for t in sfw:
+        name = t.get("name") if isinstance(t, dict) else t
+        if isinstance(name, str):
+            names.append(name)
+    needle = partial.lower().replace(" ", "-").replace("_", "-")
+    return [n for n in names if needle in n.lower()][:limit]
 
 
 async def search_google_cse(session: aiohttp.ClientSession, query: str, count: int, **kwargs) -> List[ImageResult]:
@@ -477,34 +746,114 @@ async def search_giphy(session: aiohttp.ClientSession, query: str, count: int, *
 
 
 async def search_tenor(session: aiohttp.ClientSession, query: str, count: int, **kwargs) -> List[ImageResult]:
-    """GIF search via Tenor (free Google API key: https://tenor.com/gifapi/documentation).
-    sort="trending" pulls Tenor's featured/trending feed instead of searching (query is ignored in that mode)."""
-    if not TENOR_API_KEY:
-        raise RuntimeError("TENOR_API_KEY is not set.")
-    limit = min(max(count, 1), 50)
-    common = {"key": TENOR_API_KEY, "limit": limit, "media_filter": "gif", "client_key": "telegram_photo_bot"}
-    if kwargs.get("sort") == "trending":
-        url = "https://tenor.googleapis.com/v2/featured"
-        params = common
-    else:
-        url = "https://tenor.googleapis.com/v2/search"
-        params = {**common, "q": query}
-    async with session.get(url, params=params) as resp:
+    """
+    DEAD: Google fully decommissioned the Tenor API on 2026-06-30 -- every
+    integration, including this one, stopped working that day. There is no
+    successor endpoint; Google's own guidance is to migrate to GIPHY (or a
+    third party like Klipy). Kept here (raising immediately, before any
+    network call) so /search tenor and old TENOR_API_KEY configs fail with
+    an accurate explanation instead of a confusing network error.
+    """
+    raise RuntimeError(DEPRECATED_PROVIDERS["tenor"])
+
+
+async def search_openverse(session: aiohttp.ClientSession, query: str, count: int, **kwargs) -> List[ImageResult]:
+    """
+    Openverse (api.openverse.org) -- a free, keyless search over hundreds of
+    millions of Creative Commons / public-domain images pulled from Flickr,
+    Wikimedia Commons, museums and more. license_type=commercial is always
+    forced, so every result permits commercial use (this bot is meant for
+    monetized video); note that CC-BY results still require crediting the
+    creator -- the source page for each image is on Openverse itself.
+    """
+    # Anonymous requests are capped at 20 results per page (larger page_size
+    # gets rejected), so fetch up to 2 pages to have headroom for the
+    # resolution/type filters that run afterwards.
+    wanted = max(min(count * 2, 40), 10)
+    results: List[ImageResult] = []
+    for page in range(1, (wanted + 19) // 20 + 1):
+        params = {
+            "q": query,
+            "license_type": "commercial",
+            "page_size": 20,
+            "page": page,
+        }
+        wanted_ext = (kwargs.get("file_type") or "").lower().lstrip(".")
+        if wanted_ext:
+            params["extension"] = "jpg" if wanted_ext == "jpeg" else wanted_ext
+        async with session.get("https://api.openverse.org/v1/images/", params=params) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+
+        page_items = data.get("results", [])
+        for item in page_items:
+            file_url = item.get("url")
+            if not file_url:
+                continue
+            results.append(ImageResult(
+                url=file_url,
+                width=int(item.get("width") or 0),
+                height=int(item.get("height") or 0),
+                source="openverse",
+                ident=str(item.get("id", "")),
+                thumbnail_url=item.get("thumbnail"),
+                source_page=item.get("foreign_landing_url"),
+            ))
+        if len(results) >= wanted or len(page_items) < 20:
+            break
+    return results
+
+
+# Excludes Noncommercial/ShareAlike-only licenses -- this bot is meant for
+# monetized video use, and the free-provider picks throughout this file are
+# all chosen for licenses that permit that. Still check the specific sound's
+# page for attribution wording before publishing; CC-BY requires credit.
+FREESOUND_LICENSE_FILTER = 'license:("Creative Commons 0" OR "Attribution")'
+FREESOUND_SORT_MAP = {"popular": "downloads_desc", "new": "created_desc", "relevance": "score"}
+
+
+async def search_freesound(session: aiohttp.ClientSession, query: str, count: int, **kwargs) -> List[ImageResult]:
+    """
+    Freesound.org sound-effects search. Needs a free FREESOUND_API_KEY --
+    simple API-key auth is enough for text search + downloading the
+    "preview" encode (good-quality MP3); Freesound's original uncompressed
+    file requires a full OAuth2 flow, which this bot doesn't implement, so
+    the preview is what gets downloaded/sent.
+    """
+    if not FREESOUND_API_KEY:
+        raise RuntimeError("FREESOUND_API_KEY is not set.")
+    sort = FREESOUND_SORT_MAP.get(kwargs.get("sort"), "score")
+    params = {
+        "query": query,
+        "token": FREESOUND_API_KEY,
+        "page_size": min(max(count, 1), 150),
+        "sort": sort,
+        "filter": FREESOUND_LICENSE_FILTER,
+        "fields": "id,name,previews,duration,license",
+    }
+    async with session.get("https://freesound.org/apiv2/search/text/", params=params) as resp:
         resp.raise_for_status()
         data = await resp.json()
+
     results = []
     for item in data.get("results", []):
-        gif = item.get("media_formats", {}).get("gif", {})
-        url = gif.get("url")
-        if not url:
+        previews = item.get("previews", {})
+        file_url = previews.get("preview-hq-mp3") or previews.get("preview-lq-mp3")
+        if not file_url:
             continue
-        dims = gif.get("dims", [0, 0])
+        # Belt-and-suspenders on top of the server-side license filter: never
+        # pass along anything that looks Noncommercial / Sampling+.
+        lic = (item.get("license") or "").lower()
+        if "-nc" in lic or "noncommercial" in lic or "sampling" in lic:
+            continue
+        # width/height are meaningless for audio -- ImageResult's size/
+        # orientation filters already treat 0 as "always passes".
         results.append(ImageResult(
-            url=url,
-            width=int(dims[0]) if dims else 0,
-            height=int(dims[1]) if len(dims) > 1 else 0,
-            source="tenor",
-            ident=item.get("id", ""),
+            url=file_url,
+            width=0,
+            height=0,
+            source="freesound",
+            ident=str(item.get("id", "")),
         ))
     return results
 
@@ -514,15 +863,31 @@ PROVIDERS = {
     "pixabay": search_pixabay,
     "unsplash": search_unsplash,
     "safebooru": search_safebooru,
+    "yandere": search_yandere,
+    "konachan": search_konachan,
     "google": search_google_cse,
     "serpapi": search_serpapi,
     "giphy": search_giphy,
     "tenor": search_tenor,
+    "openverse": search_openverse,
+    "danbooru": search_danbooru_safe,
+    "waifuim": search_waifu_im,
+    "freesound": search_freesound,
+}
+
+# Providers that are still selectable (so /search gives an accurate reason
+# instead of "unknown provider") but no longer functional at all, regardless
+# of whether an API key is configured for them.
+DEPRECATED_PROVIDERS = {
+    "tenor": (
+        "Tenor's GIF API was fully shut down by Google on 2026-06-30 and no "
+        "longer works for anyone, key or no key. Use giphy instead."
+    ),
 }
 
 # Providers whose art is often portrait-oriented (character shots, GIFs,
 # overlay PNGs) -- skip the landscape/hi-res "youtube_friendly" filter for these.
-SKIP_ORIENTATION_FILTER = {"safebooru", "giphy", "tenor"}
+SKIP_ORIENTATION_FILTER = {"safebooru", "yandere", "konachan", "danbooru", "waifuim", "giphy", "tenor", "freesound"}
 
 
 def configured_providers() -> List[str]:
@@ -539,9 +904,16 @@ def configured_providers() -> List[str]:
         avail.append("serpapi")
     if GIPHY_API_KEY:
         avail.append("giphy")
-    if TENOR_API_KEY:
-        avail.append("tenor")
+    # Tenor's API is fully decommissioned (see DEPRECATED_PROVIDERS) -- never
+    # list it as usable, even if TENOR_API_KEY is still set in .env.
+    if FREESOUND_API_KEY:
+        avail.append("freesound")
     avail.append("safebooru")  # no API key required
+    avail.append("yandere")    # no API key required (rating:safe forced)
+    avail.append("konachan")   # no API key required (rating:safe forced)
+    avail.append("danbooru")   # no API key required (rating:g forced)
+    avail.append("waifuim")    # no API key required (is_nsfw=false forced)
+    avail.append("openverse")  # no API key required (commercial licenses only)
     return avail
 
 
@@ -551,35 +923,54 @@ def configured_providers() -> List[str]:
 
 async def download_one(session: aiohttp.ClientSession, img: ImageResult, dest_dir: str, sem: asyncio.Semaphore) -> Optional[str]:
     """
-    Downloads img.url and writes it to dest_dir. The file extension is
-    determined from the URL when it's recognizable, otherwise sniffed from
-    the response's Content-Type header -- necessary for web-search results
-    (Google/SerpApi) whose links often have no extension at all.
+    Downloads img.url and writes it to dest_dir, streaming to disk in fixed
+    chunks rather than buffering the whole response in memory -- with several
+    concurrent downloads per job (and no cross-job cap before this), holding
+    full files (multi-MB photos, sometimes much larger GIFs) in RAM at once
+    is what actually blows past a container's memory limit. The file
+    extension is determined from the URL when it's recognizable, otherwise
+    sniffed from the response's Content-Type header -- necessary for
+    web-search results (Google/SerpApi) whose links often have no extension
+    at all.
     """
-    async with sem:
+    async with sem, GLOBAL_DOWNLOAD_SEMAPHORE:
+        tmp_path = None
         try:
             timeout = aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT)
             async with session.get(img.url, timeout=timeout) as resp:
                 resp.raise_for_status()
-                content = await resp.read()
                 content_type = resp.headers.get("Content-Type", "")
 
-            # Web-search-derived links (google/serpapi) occasionally resolve to
-            # an HTML page instead of the actual image (dead link, hotlink
-            # protection, a redirect to a viewer page, etc). Catch the obvious
-            # case so we don't save/send a webpage as if it were a photo.
-            if img.source in ("google", "serpapi") and "html" in content_type.lower():
-                logger.warning("Skipping non-image response for %s (Content-Type: %s)", img.url, content_type)
-                return None
+                # Links from any provider (most often web-search ones) can resolve to
+                # an HTML page instead of the actual image (dead link, hotlink
+                # protection, a redirect to a viewer page, etc). Catch the obvious
+                # case so we don't save/send a webpage as if it were a photo.
+                if "html" in content_type.lower():
+                    logger.warning("Skipping non-image response for %s (Content-Type: %s)", img.url, content_type)
+                    return None
 
-            ext = url_extension(img.url) or ext_from_content_type(content_type) or "jpg"
-            filename = f"{img.source}_{img.ident}.{ext}"
-            path = os.path.join(dest_dir, filename)
-            with open(path, "wb") as f:
-                f.write(content)
+                ext = url_extension(img.url) or ext_from_content_type(content_type) or "jpg"
+                filename = f"{img.source}_{img.ident}.{ext}"
+                path = os.path.join(dest_dir, filename)
+                tmp_path = path + ".part"
+
+                total = 0
+                with open(tmp_path, "wb") as f:
+                    async for chunk in resp.content.iter_chunked(DOWNLOAD_CHUNK_BYTES):
+                        total += len(chunk)
+                        if total > MAX_DOWNLOAD_BYTES:
+                            raise ValueError(f"exceeded {MAX_DOWNLOAD_BYTES // (1024 * 1024)}MB safety cap")
+                        f.write(chunk)
+
+            os.replace(tmp_path, path)
             return path
         except Exception as e:
             logger.warning("Failed to download %s: %s", img.url, e)
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
             return None
 
 
@@ -611,14 +1002,17 @@ PHOTO_EXTS = {"jpg", "jpeg", "png", "webp"}
 async def send_single_file(context: ContextTypes.DEFAULT_TYPE, chat_id: int, path: str, caption: str):
     """Send one downloaded file as its own message, picking the Telegram
     send method that gives the best inline preview for its type: animated
-    playback for GIFs, an inline image for common photo formats, and a
-    plain document for anything else (bmp/tiff/svg/etc)."""
+    playback for GIFs, an inline image for common photo formats, an inline
+    audio player for sound effects, and a plain document for anything else
+    (bmp/tiff/svg/etc)."""
     ext = path.rsplit(".", 1)[-1].lower()
     with open(path, "rb") as f:
         if ext == "gif":
             await context.bot.send_animation(chat_id=chat_id, animation=f, caption=caption)
         elif ext in PHOTO_EXTS:
             await context.bot.send_photo(chat_id=chat_id, photo=f, caption=caption)
+        elif ext in AUDIO_EXTS:
+            await context.bot.send_audio(chat_id=chat_id, audio=f, caption=caption)
         else:
             await context.bot.send_document(chat_id=chat_id, document=f, caption=caption)
 
@@ -644,44 +1038,220 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# ---------------------------------------------------------------------------
+# /overlay -- locally generated thumbnail elements (arrows, circles, boxes,
+# stars) as transparent PNGs. Generated rather than fetched: the free
+# icon/clipart sites that carry these (Flaticon, Icons8, Noun Project) all
+# require attribution or a paid plan for commercial use, whereas a shape this
+# simple has no licensing strings at all when drawn here.
+# ---------------------------------------------------------------------------
+OVERLAY_SHAPES = ["arrow", "circle", "box", "star"]
+OVERLAY_COLORS = {
+    "red": (255, 32, 32),
+    "yellow": (255, 214, 0),
+    "green": (40, 200, 60),
+    "blue": (30, 120, 255),
+    "orange": (255, 140, 0),
+    "pink": (255, 60, 160),
+    "white": (255, 255, 255),
+    "black": (0, 0, 0),
+}
+# Arrow directions -> counter-clockwise rotation in degrees from "pointing right".
+OVERLAY_DIRECTIONS = {
+    "right": 0, "up-right": 45, "up": 90, "up-left": 135,
+    "left": 180, "down-left": 225, "down": 270, "down-right": 315,
+}
+_OVERLAY_CANVAS = 1024   # drawn at this size, then downscaled 2x for smooth edges
+_OVERLAY_OUT = 512
+
+
+def _hex_to_rgb(token: str):
+    t = token.lstrip("#")
+    if len(t) == 6:
+        try:
+            return tuple(int(t[i:i + 2], 16) for i in (0, 2, 4))
+        except ValueError:
+            return None
+    return None
+
+
+def render_overlay(shape: str, color, direction: str = "right", out_path: str = "overlay.png") -> str:
+    """Draws one shape as a transparent RGBA PNG at out_path. Blocking (Pillow) -- call via a thread."""
+    S = _OVERLAY_CANVAS
+    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    fill = tuple(color) + (255,)
+    outline = (0, 0, 0, 255) if sum(color) > 90 else (255, 255, 255, 255)
+    ow = 22  # outline width so the shape stays visible on any background
+
+    if shape == "arrow":
+        pts = [(100, 420), (560, 420), (560, 250), (940, 512), (560, 774), (560, 604), (100, 604)]
+        d.polygon(pts, fill=fill)
+        d.line(pts + [pts[0]], fill=outline, width=ow, joint="curve")
+    elif shape == "circle":
+        box = (90, 150, 934, 874)
+        d.ellipse(box, outline=outline, width=96)
+        d.ellipse((box[0] + 13, box[1] + 13, box[2] - 13, box[3] - 13), outline=fill, width=70)
+    elif shape == "box":
+        box = (100, 180, 924, 844)
+        d.rectangle(box, outline=outline, width=96)
+        d.rectangle((box[0] + 13, box[1] + 13, box[2] - 13, box[3] - 13), outline=fill, width=70)
+    elif shape == "star":
+        cx = cy = S / 2
+        outer, inner = 430, 180
+        pts = []
+        for i in range(10):
+            r = outer if i % 2 == 0 else inner
+            a = math.radians(-90 + i * 36)
+            pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
+        d.polygon(pts, fill=fill)
+        d.line(pts + [pts[0]], fill=outline, width=ow, joint="curve")
+    else:
+        raise ValueError(f"unknown shape {shape!r}")
+
+    if shape == "arrow" and OVERLAY_DIRECTIONS.get(direction, 0):
+        img = img.rotate(OVERLAY_DIRECTIONS[direction], resample=Image.BICUBIC, expand=False)
+    img = img.resize((_OVERLAY_OUT, _OVERLAY_OUT), Image.LANCZOS)
+    img.save(out_path, "PNG")
+    return out_path
+
+
+async def _send_overlay(context: ContextTypes.DEFAULT_TYPE, chat_id: int, shape: str, color_name: str,
+                        rgb, direction: str):
+    job_dir = os.path.join(WORKDIR, f"overlay_{chat_id}_{uuid.uuid4().hex}")
+    os.makedirs(job_dir, exist_ok=True)
+    try:
+        suffix = f"_{direction}" if shape == "arrow" else ""
+        path = os.path.join(job_dir, f"{shape}_{color_name}{suffix}.png")
+        await asyncio.to_thread(render_overlay, shape, rgb, direction, path)
+        # send_document (not send_photo) so Telegram doesn't flatten the transparency.
+        with open(path, "rb") as f:
+            await context.bot.send_document(chat_id=chat_id, document=f, caption=f"{shape} · {color_name}{suffix}")
+    finally:
+        shutil.rmtree(job_dir, ignore_errors=True)
+
+
+async def overlay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/overlay [shape] [color|#hex] [direction] -- tokens in any order. No args opens a button menu."""
+    args = [a.lower() for a in (context.args or [])]
+    if not args:
+        rows = [[(s.title(), f"ov|shape|{s}") for s in OVERLAY_SHAPES[:2]],
+                [(s.title(), f"ov|shape|{s}") for s in OVERLAY_SHAPES[2:]]]
+        await update.message.reply_text("What kind of overlay?", reply_markup=_wiz_kb(rows))
+        return
+
+    shape, color_name, rgb, direction = None, "red", OVERLAY_COLORS["red"], "right"
+    for a in args:
+        if a in OVERLAY_SHAPES:
+            shape = a
+        elif a in OVERLAY_COLORS:
+            color_name, rgb = a, OVERLAY_COLORS[a]
+        elif a in OVERLAY_DIRECTIONS:
+            direction = a
+        elif _hex_to_rgb(a):
+            color_name, rgb = a.lstrip("#"), _hex_to_rgb(a)
+        else:
+            await update.message.reply_text(
+                f"Didn't understand “{a}”. Usage: /overlay <{'|'.join(OVERLAY_SHAPES)}> "
+                f"[{'|'.join(OVERLAY_COLORS)}|#hex] [{'|'.join(OVERLAY_DIRECTIONS)}]"
+            )
+            return
+    if not shape:
+        await update.message.reply_text(f"Pick a shape: {', '.join(OVERLAY_SHAPES)}")
+        return
+    await _send_overlay(context, update.effective_chat.id, shape, color_name, rgb, direction)
+
+
+async def handle_overlay_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cb = update.callback_query
+    await cb.answer()
+    parts = (cb.data or "").split("|")
+    if len(parts) < 3 or parts[0] != "ov":
+        return
+    step, value = parts[1], parts[2]
+    chat_id = cb.message.chat_id
+
+    if step == "shape":
+        names = list(OVERLAY_COLORS)
+        rows = [[(n.title(), f"ov|color|{n}|{value}") for n in names[i:i + 4]] for i in range(0, len(names), 4)]
+        await cb.edit_message_text(f"{value.title()} — which color?", reply_markup=_wiz_kb(rows))
+        return
+
+    if step == "color" and len(parts) >= 4:
+        shape = parts[3]
+        if shape == "arrow":
+            dirs = list(OVERLAY_DIRECTIONS)
+            rows = [[(n, f"ov|dir|{n}|{value}") for n in dirs[i:i + 4]] for i in range(0, len(dirs), 4)]
+            await cb.edit_message_text(f"{value.title()} arrow — which direction?", reply_markup=_wiz_kb(rows))
+            return
+        await cb.edit_message_text(f"Generating {value} {shape}…")
+        await _send_overlay(context, chat_id, shape, value, OVERLAY_COLORS[value], "right")
+        return
+
+    if step == "dir" and len(parts) >= 4:
+        color_name = parts[3]
+        await cb.edit_message_text(f"Generating {color_name} arrow ({value})…")
+        await _send_overlay(context, chat_id, "arrow", color_name, OVERLAY_COLORS[color_name], value)
+        return
+
+
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "*Quick mode*\n"
-        "Type a word or phrase (no command) and I'll show 4 inline buttons — "
-        "Google, Stock, Safebooru, GIF.\n"
-        "• Tap *Safebooru* and I'll ask you to type part of the character "
-        "name — I look it up against Safebooru's own tag-autocomplete API "
-        "(the same one on their site) and show you real matching tags to "
-        "pick from, so you don't have to guess underscore formatting "
-        "yourself. Then you'll get sort options matching its own scoring "
-        "system: 🔥 Top (score), 🆕 New, 🎲 Random.\n"
-        "• Tap *Stock* or *GIF* and you'll get their own sort options "
-        "(Popular/Latest, Trending/Best match); *Google* skips straight to count.\n"
+        "Type a word or phrase (no command) and I'll show inline buttons for "
+        "each configured source — Google, Pexels, Pixabay, Unsplash, Anime "
+        "art, GIF, SFX, Openverse.\n"
+        "• Tap *Anime art* and pick a site — Safebooru, Danbooru (safe), "
+        "Yande.re, Konachan, or Waifu.im. Then type part of the character name; I look it up "
+        "against that site's own tag-autocomplete API and show you real "
+        "matching tags to pick from, so you don't have to guess underscore "
+        "formatting yourself. Results are always safe-rated only, even on "
+        "Yande.re/Konachan which otherwise host non-safe content. Sort "
+        "options: 🔥 Top (score), 🆕 New, 🎲 Random.\n"
+        "• Tap *Pixabay*, *Unsplash*, *GIF*, or *SFX* for their own sort "
+        "options (Popular/Latest, Trending/Best match); *Pexels*, *Google*, "
+        "and *Openverse* skip straight to count since those APIs don't "
+        "support ordering results.\n"
         "• Every category then asks for count (5-30), minimum resolution "
-        "(Any / HD / Full HD), and delivery — 📦 one zip file, or 🖼 sent as "
-        "individual messages.\n"
-        "• Tap *All of the above* to skip the wizard and get all 4 "
-        "categories at once with default settings.\n\n"
+        "(Any / HD / Full HD -- ignored for SFX), and delivery — 📦 one zip "
+        "file, or 🖼 sent as individual messages.\n"
+        "• Tap *All of the above* to skip the wizard and get every "
+        "configured category at once with default settings.\n\n"
         "*Full control*\n"
-        "/search <query> [count] [provider] [type:png|jpg|gif] [minscore:N]\n"
+        "/search <query> [count] [provider] [type:png|jpg|gif|mp3] [minscore:N]\n"
         "  • count: 1-30 (web engines default 10-20, others default 10)\n"
         f"  • provider: one of {', '.join(PROVIDERS.keys())} (default: {DEFAULT_PROVIDER})\n"
-        "  • type: keep only this file type — works for ANY provider, any image type "
-        "(png/jpg/gif/webp/bmp/tiff/svg)\n"
-        "  • minscore: (safebooru only) drop results below this score\n"
+        "  • type: keep only this file type — works for ANY provider, any "
+        "image or audio type (png/jpg/gif/webp/bmp/tiff/svg/mp3)\n"
+        "  • minscore: (booru sites only) drop results below "
+        "this score\n"
         "  (/search always zips its results; use the button wizard for "
         "individual-upload delivery or sort/resolution choices)\n"
         "/providers — list which providers have API keys configured\n\n"
         "*Stock photos* (pexels/pixabay/unsplash): filtered to landscape, "
         f"≥{MIN_WIDTH_FOR_YOUTUBE}px wide by default.\n"
-        "*Anime art* (safebooru): exact character/tag search, safe-rated only, "
-        "no key needed.\n"
-        "  e.g. `/search hatsune_miku 20 safebooru type:png minscore:80`\n"
-        "*GIFs* (giphy/tenor): free API key each.\n"
+        "*Anime art* (safebooru/danbooru/yandere/konachan/waifuim): tag "
+        "search, safe-rated only (forced, not optional), no key needed.\n"
+        "  e.g. `/search hatsune_miku 20 yandere type:png minscore:80`\n"
+        "*GIFs* (giphy): free API key. Tenor's API was fully shut down by "
+        "Google on 2026-06-30 and no longer works.\n"
         "  e.g. `/search excited cat 15 giphy`\n"
+        "*SFX* (freesound): sound effects, CC0/Attribution-licensed only "
+        "(no Noncommercial-restricted results) since this is meant for "
+        "monetized video -- still check the sound's page for attribution "
+        "wording before publishing.\n"
+        "  e.g. `/search explosion 10 freesound`\n"
+        "*Openverse* (openverse): Creative Commons images from Flickr, "
+        "Wikimedia, museums etc., commercial-use licenses only, no key "
+        "needed. CC-BY results still need crediting the creator.\n"
+        "  e.g. `/search mount fuji 15 openverse`\n"
+        "*Thumbnail elements*: `/overlay` makes transparent PNG arrows, "
+        "circles, boxes and stars locally (no download, no licensing) — "
+        "e.g. `/overlay arrow red up-right`, `/overlay circle yellow`, "
+        "`/overlay star #ff00aa`, or just `/overlay` for buttons.\n"
         "*Real web images* (google/serpapi): google is a curated free-tier "
-        "Custom Search; serpapi is paid, real Google Images results, use it "
-        "when CSE's index doesn't have what you want.\n"
+        "Custom Search (closed to new sign-ups as of 2026 -- see README); "
+        "serpapi is paid, real Google Images results.\n"
         "  e.g. `/search cyberpunk skyline 15 serpapi type:png`\n\n"
         "For google/serpapi, the file type is sniffed from the actual "
         "downloaded file (not guessed from the URL), since web links often "
@@ -723,16 +1293,19 @@ def parse_search_args(raw_args: List[str]):
             key, val = m.group(1).lower(), m.group(2)
             if key in ("type", "filetype"):
                 extra["file_type"] = val.lower().lstrip(".")
-            else:
+            elif re.fullmatch(r"-?\d+", val):
                 extra["minscore"] = val
         else:
             remaining.append(tok)
     args = remaining
 
-    if args and args[-1].lower() in PROVIDERS:
-        provider = args.pop().lower()
-    if args and re.fullmatch(r"\d+", args[-1]):
-        count = max(1, min(int(args.pop()), MAX_COUNT))
+    provider_set = False
+    for _ in range(2):  # trailing [count] and [provider], accepted in either order
+        if args and not provider_set and args[-1].lower() in PROVIDERS:
+            provider = args.pop().lower()
+            provider_set = True
+        elif args and count is None and re.fullmatch(r"\d+", args[-1]):
+            count = max(1, min(int(args.pop()), MAX_COUNT))
 
     query = " ".join(args).strip()
     return query, count, provider, extra
@@ -748,6 +1321,10 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if provider not in PROVIDERS:
         await update.message.reply_text(f"Unknown provider '{provider}'. Choose from: {', '.join(PROVIDERS)}")
+        return
+
+    if provider in DEPRECATED_PROVIDERS:
+        await update.message.reply_text(f"⚠️ {DEPRECATED_PROVIDERS[provider]}")
         return
 
     if provider not in configured_providers():
@@ -782,34 +1359,72 @@ async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 CATEGORY_PROVIDER_PRIORITY = {
     "google": ["google", "serpapi"],
-    "stock": ["pexels", "pixabay", "unsplash"],
-    "safebooru": ["safebooru"],
-    "gif": ["giphy", "tenor"],
+    "pexels": ["pexels"],
+    "pixabay": ["pixabay"],
+    "unsplash": ["unsplash"],
+    # Used only for "All of the above"'s default pick and button-visibility
+    # checks -- the interactive per-tap flow instead offers an explicit site
+    # picker (see ANIME_SITES below) since all three need no API key and so
+    # would otherwise always resolve to the first one, silently.
+    "anime": ["safebooru", "danbooru", "yandere", "konachan", "waifuim"],
+    "gif": ["giphy"],  # tenor removed: its API is fully decommissioned, see DEPRECATED_PROVIDERS
+    "sfx": ["freesound"],
+    "openverse": ["openverse"],
 }
-# Pexels' search endpoint has no date/"latest" ordering parameter at all, so
-# picking "🆕 Latest" while Pexels is the resolved stock provider would
-# silently do nothing (still relevance-ordered). These are the stock
-# providers that DO support it -- used to re-route the pick, below.
-STOCK_PROVIDERS_SUPPORTING_LATEST = ("pixabay", "unsplash")
-CATEGORY_ORDER = ["google", "stock", "safebooru", "gif"]
+CATEGORY_ORDER = ["google", "pexels", "pixabay", "unsplash", "openverse", "anime", "gif", "sfx"]
 CATEGORY_BUTTON_LABELS = {
     "google": "🔎 Google",
-    "stock": "🖼 Stock photos",
-    "safebooru": "🎌 Safebooru",
+    "pexels": "📷 Pexels",
+    "pixabay": "🖼 Pixabay",
+    "unsplash": "📸 Unsplash",
+    "anime": "🎌 Anime art",
     "gif": "🎞 GIF",
+    "sfx": "🔊 SFX",
+    "openverse": "🌐 Openverse",
 }
 PLAIN_TEXT_COUNT = 10  # default per-category batch size (overridden by the count step)
 
 # Sort options offered per category, as (button label, value) pairs. A
-# category with no entry here skips the sort step entirely (nothing
-# meaningful to choose between). Safebooru's options map to its own scoring
-# system (see SAFEBOORU_SORT_TAGS); stock/gif map to each API's own concept
-# of "order" -- see the sort= handling inside each search_* function.
+# category with no entry here skips the sort step entirely -- Pexels' API
+# has no ordering parameter at all (previously this bot silently re-routed
+# a "Latest" pick to Pixabay/Unsplash to work around that; splitting Pexels
+# into its own category makes that unnecessary -- it just never offers
+# "Latest"), and google/openverse are relevance-only. "anime"'s sort options
+# depend on which site the user picks and live in ANIME_SITE_SORT_OPTIONS
+# below instead, since Safebooru (Gelbooru-style) and Yande.re/Konachan
+# (Moebooru-style) don't share a sort vocabulary.
 SORT_OPTIONS = {
-    "safebooru": [("🔥 Top (score)", "score"), ("🆕 New", "new"), ("🎲 Random", "random")],
-    "stock": [("🔥 Popular", "popular"), ("🆕 Latest", "latest")],
+    "pixabay": [("🔥 Popular", "popular"), ("🆕 Latest", "latest")],
+    "unsplash": [("🔥 Popular", "popular"), ("🆕 Latest", "latest")],
     "gif": [("🔥 Trending", "trending"), ("🔍 Best match", "relevance")],
+    "sfx": [("🔥 Popular", "popular"), ("🆕 Newest", "new"), ("🔍 Best match", "relevance")],
 }
+
+# The "anime" category asks which site before asking for a tag, since each
+# has its own tag-autocomplete API (Yande.re/Konachan are safe-rated-forced
+# here regardless of sort -- see _moebooru_search).
+ANIME_SITES = [
+    ("🎌 Safebooru", "safebooru"),
+    ("🅳 Danbooru (safe)", "danbooru"),
+    ("🌸 Yande.re", "yandere"),
+    ("🎨 Konachan", "konachan"),
+    ("💫 Waifu.im", "waifuim"),
+]
+ANIME_SITE_AUTOCOMPLETE = {
+    "safebooru": safebooru_autocomplete,
+    "yandere": yandere_autocomplete,
+    "konachan": konachan_autocomplete,
+    "danbooru": danbooru_safe_autocomplete,
+    "waifuim": waifu_im_autocomplete,
+}
+ANIME_SITE_SORT_OPTIONS = {
+    "safebooru": [("🔥 Top (score)", "score"), ("🆕 New", "new"), ("🎲 Random", "random")],
+    "yandere": [("🔥 Top (score)", "score"), ("🆕 New", "new"), ("🎲 Random", "random")],
+    "konachan": [("🔥 Top (score)", "score"), ("🆕 New", "new"), ("🎲 Random", "random")],
+    "danbooru": [("🔥 Top (score)", "score"), ("🆕 New", "new"), ("🎲 Random", "random")],
+    "waifuim": [("⭐ Most favorited", "favorites"), ("🎲 Random", "random")],
+}
+
 COUNT_OPTIONS = [5, 10, 15, 20, 30]
 SIZE_OPTIONS = [("Any size", "any"), ("HD (≥1280px)", "hd"), ("Full HD (≥1920px)", "fhd")]
 DELIVERY_OPTIONS = [("📦 Zip file", "zip"), ("🖼 Send individually", "individual")]
@@ -845,6 +1460,34 @@ def build_category_plan():
     return plan, missing
 
 
+async def autocomplete_with_fallbacks(fn, text: str, limit: int = 8) -> List[str]:
+    """
+    Runs a site's tag-autocomplete on what the user typed; if that finds
+    nothing, also tries the words in reverse order and each word on its own.
+    Booru tags follow Japanese name order ("furudo_erika", not
+    "erika_furudo"), so a Western-order name typed as-is matches nothing.
+    """
+    found = await fn(text, limit)
+    if found:
+        return found
+    words = [w for w in re.split(r"[\s_\-]+", text.strip()) if len(w) >= 3]
+    attempts = []
+    if len(words) >= 2:
+        attempts.append("_".join(reversed(words)))
+    attempts += sorted(set(words), key=len, reverse=True)[:2]
+    attempts = [a for a in dict.fromkeys(attempts) if a.lower() != text.strip().lower()]
+    if not attempts:
+        return []
+    batches = await asyncio.gather(*[fn(a, limit) for a in attempts], return_exceptions=True)
+    merged: List[str] = []
+    for batch in batches:
+        if isinstance(batch, list):
+            for t in batch:
+                if t not in merged:
+                    merged.append(t)
+    return merged[:limit]
+
+
 def _wiz_kb(rows):
     """rows: list of lists of (label, callback_data) -> InlineKeyboardMarkup."""
     return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=cd) for label, cd in row] for row in rows])
@@ -852,25 +1495,30 @@ def _wiz_kb(rows):
 
 async def handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    A plain message with no leading slash normally shows the 4 category
-    buttons. The one exception: if this chat is mid-wizard waiting on a
-    Safebooru tag (after tapping the Safebooru button), this message is
-    looked up against Safebooru's own tag-autocomplete API instead of being
-    used as the tag verbatim.
+    A plain message with no leading slash normally shows the category
+    buttons. The one exception: if this chat is mid-wizard waiting on an
+    anime tag (after tapping Anime art -> picking Safebooru/Yande.re/
+    Konachan), this message is looked up against that site's own
+    tag-autocomplete API instead of being used as the tag verbatim.
     """
     text = (update.message.text or "").strip()
     if not text:
         return
 
-    awaiting_id = context.chat_data.get("awaiting_safebooru_tag")
+    awaiting_id = context.chat_data.get("awaiting_anime_tag")
     if awaiting_id:
-        context.chat_data.pop("awaiting_safebooru_tag", None)
+        context.chat_data.pop("awaiting_anime_tag", None)
         entry = PENDING_SEARCHES.get(awaiting_id)
         if not entry:
             return
 
+        site = entry.get("provider", "safebooru")
+        site_label = dict(ANIME_SITES).get(site, site)
+        autocomplete_fn = ANIME_SITE_AUTOCOMPLETE.get(site, safebooru_autocomplete)
+        sort_options = ANIME_SITE_SORT_OPTIONS.get(site, ANIME_SITE_SORT_OPTIONS["safebooru"])
+
         typed_fallback = text if "," in text else text.replace(" ", "_")
-        suggestions = await safebooru_autocomplete(text)
+        suggestions = await autocomplete_with_fallbacks(autocomplete_fn, text)
 
         if suggestions:
             entry["tag_suggestions"] = suggestions
@@ -878,15 +1526,15 @@ async def handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             rows = [[(f"🏷 {tag}", f"wz|tagpick|{i}|{awaiting_id}")] for i, tag in enumerate(suggestions)]
             rows.append([(f"✅ Use “{typed_fallback}” as typed", f"wz|tagpick|-1|{awaiting_id}")])
             await update.message.reply_text(
-                f"Safebooru tags matching “{text}”:", reply_markup=_wiz_kb(rows)
+                f"{site_label} tags matching “{text}”:", reply_markup=_wiz_kb(rows)
             )
         else:
             entry["query"] = typed_fallback
             keyboard = _wiz_kb([[
-                (label, f"wz|sort|{val}|{awaiting_id}") for label, val in SORT_OPTIONS["safebooru"]
+                (label, f"wz|sort|{val}|{awaiting_id}") for label, val in sort_options
             ]])
             await update.message.reply_text(
-                f"No Safebooru tag matches for “{text}” — using it as-is: "
+                f"No {site_label} tag matches for “{text}” — using it as-is: "
                 f"“{typed_fallback}”. Sort by:",
                 reply_markup=keyboard,
             )
@@ -950,15 +1598,12 @@ async def handle_wizard_button(update: Update, context: ContextTypes.DEFAULT_TYP
         entry["category"] = value
         entry["provider"] = provider
 
-        if value == "safebooru":
-            # Safebooru's tag matching is strict/literal (no natural-language
-            # fuzzy matching), so look up real tags via its own autocomplete
-            # API before running anything.
-            context.chat_data["awaiting_safebooru_tag"] = search_id
-            await cb.edit_message_text(
-                f"Type part of the character name or tag — I'll look it up "
-                f"against Safebooru's own tag list (you searched “{query}”)."
-            )
+        if value == "anime":
+            # Which site? Each has its own tag-autocomplete API and sort
+            # vocabulary (see ANIME_SITE_AUTOCOMPLETE / ANIME_SITE_SORT_OPTIONS).
+            site_btns = [(label, f"wz|animesite|{val}|{search_id}") for label, val in ANIME_SITES]
+            keyboard = _wiz_kb([site_btns[i:i + 2] for i in range(0, len(site_btns), 2)])
+            await cb.edit_message_text("Which anime site?", reply_markup=keyboard)
             return
 
         if value in SORT_OPTIONS:
@@ -971,6 +1616,21 @@ async def handle_wizard_button(update: Update, context: ContextTypes.DEFAULT_TYP
             await cb.edit_message_text(f"[{value}] How many results?", reply_markup=keyboard)
         return
 
+    if step == "animesite":
+        site = value
+        entry["provider"] = site
+        # All three sites use strict/literal booru tag matching (no
+        # natural-language fuzzy matching), so look up real tags via that
+        # site's own autocomplete API before running anything.
+        context.chat_data["awaiting_anime_tag"] = search_id
+        site_label = dict(ANIME_SITES).get(site, site)
+        await cb.edit_message_text(
+            f"Type part of the character name or tag — I'll look it up "
+            f"against {site_label}'s own tag list (you searched “{query}”).\n"
+            f"Tip: booru tags use Japanese name order, e.g. furudo_erika, not erika_furudo."
+        )
+        return
+
     if step == "tagpick":
         idx = int(value)
         suggestions = entry.get("tag_suggestions", [])
@@ -980,25 +1640,26 @@ async def handle_wizard_button(update: Update, context: ContextTypes.DEFAULT_TYP
             chosen_tag = suggestions[idx]
         entry["query"] = chosen_tag
         query = chosen_tag
-        keyboard = _wiz_kb([[(label, f"wz|sort|{val}|{search_id}") for label, val in SORT_OPTIONS["safebooru"]]])
+        site = entry.get("provider", "safebooru")
+        sort_options = ANIME_SITE_SORT_OPTIONS.get(site, ANIME_SITE_SORT_OPTIONS["safebooru"])
+        keyboard = _wiz_kb([[(label, f"wz|sort|{val}|{search_id}") for label, val in sort_options]])
         await cb.edit_message_text(f"Tag: “{chosen_tag}”. Sort by:", reply_markup=keyboard)
         return
 
     if step == "sort":
         entry["sort"] = value
-        note = ""
-        if entry["category"] == "stock" and value == "latest" and entry.get("provider") == "pexels":
-            avail_providers = set(configured_providers())
-            fallback = next((p for p in STOCK_PROVIDERS_SUPPORTING_LATEST if p in avail_providers), None)
-            if fallback:
-                entry["provider"] = fallback
-                note = f" (using {fallback} -- Pexels has no \"latest\" ordering)"
         keyboard = _wiz_kb([[(str(n), f"wz|count|{n}|{search_id}") for n in COUNT_OPTIONS]])
-        await cb.edit_message_text(f"[{entry['category']}] How many results?{note}", reply_markup=keyboard)
+        await cb.edit_message_text(f"[{entry['category']}] How many results?", reply_markup=keyboard)
         return
 
     if step == "count":
         entry["count"] = int(value)
+        if entry["category"] == "sfx":
+            # audio has no resolution -- skip straight to delivery
+            entry["size"] = "any"
+            keyboard = _wiz_kb([[(label, f"wz|deliver|{val}|{search_id}") for label, val in DELIVERY_OPTIONS]])
+            await cb.edit_message_text(f"[{entry['category']}] Deliver as:", reply_markup=keyboard)
+            return
         keyboard = _wiz_kb([[(label, f"wz|size|{val}|{search_id}") for label, val in SIZE_OPTIONS]])
         await cb.edit_message_text(f"[{entry['category']}] Minimum resolution?", reply_markup=keyboard)
         return
@@ -1012,13 +1673,14 @@ async def handle_wizard_button(update: Update, context: ContextTypes.DEFAULT_TYP
     if step == "deliver":
         category = entry["category"]
         provider = entry["provider"]
+        label = provider if category == "anime" else category
         extra = {"sort": entry.get("sort"), "size": entry.get("size", "any")}
         count = entry.get("count", PLAIN_TEXT_COUNT)
 
-        status_msg = await cb.edit_message_text(f"[{category}] 🔎 Searching for “{query}”…")
+        status_msg = await cb.edit_message_text(f"[{label}] 🔎 Searching for “{query}”…")
         await run_search_job(
             context, chat_id, query, count, provider, extra, status_msg,
-            label=category, delivery=value,
+            label=label, delivery=value,
         )
         PENDING_SEARCHES.pop(search_id, None)
         return
@@ -1060,7 +1722,7 @@ async def run_search_job(
         job_timeout = 20 + effective_count * 8  # scales with batch size; generous but finite
 
         async def _do_job():
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT)) as session:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT), headers=HTTP_HEADERS) as session:
                 search_fn = PROVIDERS[provider]
 
                 # Web search engines (google/serpapi) return arbitrary web-page
@@ -1219,6 +1881,8 @@ def main():
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("providers", providers_cmd))
     app.add_handler(CommandHandler("search", search_cmd))
+    app.add_handler(CommandHandler("overlay", overlay_cmd))
+    app.add_handler(CallbackQueryHandler(handle_overlay_button, pattern=r"^ov\|"))
     app.add_handler(CallbackQueryHandler(handle_wizard_button, pattern=r"^wz\|"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_plain_text))
 
