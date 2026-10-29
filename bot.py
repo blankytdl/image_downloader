@@ -997,23 +997,27 @@ def chunk_by_size(paths: List[str], limit_bytes: int) -> List[List[str]]:
 
 
 PHOTO_EXTS = {"jpg", "jpeg", "png", "webp"}
+TELEGRAM_PHOTO_SIZE_LIMIT = 10 * 1024 * 1024  # Telegram sendPhoto limit: 10 MiB
 
 
 async def send_single_file(context: ContextTypes.DEFAULT_TYPE, chat_id: int, path: str, caption: str):
-    """Send one downloaded file as its own message, picking the Telegram
-    send method that gives the best inline preview for its type: animated
-    playback for GIFs, an inline image for common photo formats, an inline
-    audio player for sound effects, and a plain document for anything else
-    (bmp/tiff/svg/etc)."""
+    """Send a downloaded file using the best Telegram method for its type.
+
+    Telegram limits sendPhoto uploads to 10 MiB. Larger image files are sent
+    as documents instead, preserving the original file and avoiding a
+    BadRequest that would otherwise interrupt the batch.
+    """
     ext = path.rsplit(".", 1)[-1].lower()
+    file_size = os.path.getsize(path)
     with open(path, "rb") as f:
         if ext == "gif":
             await context.bot.send_animation(chat_id=chat_id, animation=f, caption=caption)
-        elif ext in PHOTO_EXTS:
+        elif ext in PHOTO_EXTS and file_size <= TELEGRAM_PHOTO_SIZE_LIMIT:
             await context.bot.send_photo(chat_id=chat_id, photo=f, caption=caption)
         elif ext in AUDIO_EXTS:
             await context.bot.send_audio(chat_id=chat_id, audio=f, caption=caption)
         else:
+            # Includes oversized JPG/PNG/WebP files: send unchanged as a document.
             await context.bot.send_document(chat_id=chat_id, document=f, caption=caption)
 
 
