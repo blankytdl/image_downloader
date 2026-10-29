@@ -25,34 +25,27 @@ cat wearing sunglasses
 **Google**, **Pexels**, **Pixabay**, **Unsplash**, **Anime art**,
 **GIF**, **SFX**, **Openverse** — plus **All of the above**.
 
-- Tap **Anime art** and the bot first asks *which site* — Safebooru,
-  Danbooru (safe), Yande.re, Konachan, or Waifu.im (each has its own tag
-  vocabulary). Then it
-  asks you to type part of the character name or tag, and looks that
-  up against **that site's own tag-autocomplete API** (the same
-  endpoint that backs the search box on the site itself) and shows
-  you real, existing tags to pick from, instead of you having to
-  guess exact underscore formatting yourself. If nothing matches, it
-  falls back to using your text as-is. After picking a tag, you get
-  sort options matching that site's own scoring system: 🔥 **Top
-  (score)**, 🆕 **New**, 🎲 **Random**. Results are always
-  safe-rated only — Yande.re and Konachan otherwise host non-safe
-  content, so this bot forces a safe-rating filter on every query to
-  those two, with no way to turn it off.
+- Tap **Anime art** to search all five anime sources together — Safebooru,
+  Danbooru, Yande.re, Konachan, and Waifu.im — in parallel. The bot applies
+  each provider's own safe-rated defaults and combines the results under
+  this single button.
+- Tap **Puzzle Images (6K+)** for a separate anime-only search across those
+  same five providers. Only images whose longest side meets the configured
+  minimum dimension are kept (6,000 px by default). Unknown dimensions are
+  excluded so smaller images cannot slip through.
 - Tap **Pixabay**, **Unsplash**, **GIF**, or **SFX** and you get
   their own sort options (Popular/Latest; Trending/Best match).
   **Pexels**, **Google**, and **Openverse** have no ordering concept
   in their APIs and skip straight to the next step.
 - Every category then walks through: **count** (5/10/15/20/30),
   **minimum resolution** (Any / HD ≥1280px / Full HD ≥1920px —
-  ignored for SFX, which has no dimensions), and **delivery** — 📦
-  one zip file, or 🖼 sent as individual messages (photos inline,
-  GIFs as animations, SFX as playable audio, anything else as a
-  document).
-- Tap **All of the above** to skip the wizard entirely and get every
-  configured category at once with default settings (top/relevance
-  sort, 10 results, any resolution, zipped) — anime art defaults to
-  Safebooru in this mode.
+  ignored for SFX and fixed to the 6K+ threshold for Puzzle Images),
+  and **delivery** — 📦 one zip file, or 🖼 sent as individual messages
+  (photos inline up to Telegram's 10 MiB photo limit, larger images as
+  documents without recompression, GIFs as animations, SFX as playable
+  audio, anything else as a document).
+- Tap **All of the above** to skip the wizard and run all configured
+  categories with their defaults.
 
 Categories with no API key configured simply don't get a button (the
 message tells you which ones were skipped). Safebooru, Yande.re,
@@ -416,3 +409,19 @@ A couple of things specific to Deplexo's container model:
 - For heavier use, run this on a small always-on server (a $5 VPS, a
   Raspberry Pi, etc.) rather than your laptop, since `run_polling()`
   needs to stay running to receive messages.
+
+
+## Environment variables
+
+Copy `.env.example` to `.env` and fill in the keys for the providers you use.
+Anime booru providers and Openverse do not require API keys.
+
+- `TELEGRAM_BOT_TOKEN` — required Telegram bot token.
+- `PEXELS_API_KEY`, `PIXABAY_API_KEY`, `UNSPLASH_ACCESS_KEY` — stock-photo providers.
+- `GOOGLE_CSE_API_KEY` and `GOOGLE_CSE_ENGINE_ID` — optional Google Custom Search.
+- `SERPAPI_KEY` — optional SerpApi image search.
+- `GIPHY_API_KEY` — optional GIF search.
+- `FREESOUND_API_KEY` — optional Freesound.org sound-effects search.
+- `ANIME_PUZZLE_MIN_DIMENSION` — minimum longest-side dimension for the
+  anime-only Puzzle Images category (default `6000` pixels).
+- `GLOBAL_CONCURRENT_DOWNLOADS` — process-wide download concurrency cap (default `12`).

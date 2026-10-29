@@ -137,7 +137,10 @@ class ImageResult:
     source_page: Optional[str] = None    # page the image was found on, when the provider gives one
 
 
-SIZE_THRESHOLDS = {"any": 0, "hd": 1280, "fhd": 1920, "6k": 6000}
+# Puzzle-image search is anime-only and uses the longest side, not width alone.
+# Set ANIME_PUZZLE_MIN_DIMENSION to change the default 6K threshold.
+ANIME_PUZZLE_MIN_DIMENSION = max(1, int(os.getenv("ANIME_PUZZLE_MIN_DIMENSION", "6000")))
+SIZE_THRESHOLDS = {"any": 0, "hd": 1280, "fhd": 1920, "6k": ANIME_PUZZLE_MIN_DIMENSION}
 
 
 def passes_size_filter(img: ImageResult, size: str, require_landscape: bool) -> bool:
