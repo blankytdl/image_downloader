@@ -1683,9 +1683,7 @@ async def handle_wizard_button(update: Update, context: ContextTypes.DEFAULT_TYP
         entry["count"] = int(value)
         if entry["category"] in ("sfx", "puzzle"):
             # Audio has no resolution; puzzle category fixes resolution at 6K+.
-            if entry["category"] == "puzzle":
-                entry["size"] = "6k"
-            entry["size"] = "any"
+            entry["size"] = "6k" if entry["category"] == "puzzle" else "any"
             keyboard = _wiz_kb([[(label, f"wz|deliver|{val}|{search_id}") for label, val in DELIVERY_OPTIONS]])
             await cb.edit_message_text(f"[{entry['category']}] Deliver as:", reply_markup=keyboard)
             return
