@@ -1373,7 +1373,7 @@ CATEGORY_PROVIDER_PRIORITY = {
     "gif": ["giphy"],  # tenor removed: its API is fully decommissioned, see DEPRECATED_PROVIDERS
     "sfx": ["freesound"],
     "openverse": ["openverse"],
-    "puzzle": ["google", "serpapi", "pexels", "pixabay", "unsplash", "openverse"],
+    "puzzle": ["safebooru", "danbooru", "yandere", "konachan", "waifuim"],
 }
 CATEGORY_ORDER = ["google", "pexels", "pixabay", "unsplash", "openverse", "puzzle", "anime", "gif", "sfx"]
 CATEGORY_BUTTON_LABELS = {
