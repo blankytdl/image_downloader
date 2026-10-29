@@ -1789,7 +1789,7 @@ async def run_search_job(
 
                 require_landscape = provider not in SKIP_ORIENTATION_FILTER
                 filtered = [r for r in typed if passes_size_filter(r, size, require_landscape)]
-                if not filtered:
+                if not filtered and size != "6k":
                     filtered = typed
 
                 chosen = filtered[: (count * 3 if needs_post_filter else count)]
