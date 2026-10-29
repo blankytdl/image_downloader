@@ -1586,6 +1586,22 @@ async def handle_wizard_button(update: Update, context: ContextTypes.DEFAULT_TYP
             await cb.edit_message_text(f"🔎 Searching {', '.join(c for c, _ in plan)} for “{query}”…")
 
             async def run_one(cat: str, provider: str):
+                if cat == "anime":
+                    async def run_anime_provider(anime_provider: str):
+                        status_msg = await context.bot.send_message(
+                            chat_id=chat_id, text=f"[{anime_provider}] starting…"
+                        )
+                        sort = "favorites" if anime_provider == "waifuim" else "score"
+                        await run_search_job(
+                            context, chat_id, query, PLAIN_TEXT_COUNT, anime_provider,
+                            {"sort": sort, "size": "any"}, status_msg, label=anime_provider,
+                        )
+                    await asyncio.gather(*[
+                        run_anime_provider(p)
+                        for p in ("safebooru", "danbooru", "yandere", "konachan", "waifuim")
+                    ])
+                    return
+
                 status_msg = await context.bot.send_message(chat_id=chat_id, text=f"[{cat}] starting…")
                 await run_search_job(context, chat_id, query, PLAIN_TEXT_COUNT, provider, {}, status_msg, label=cat)
 
