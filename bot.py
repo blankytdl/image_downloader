@@ -137,7 +137,7 @@ class ImageResult:
     source_page: Optional[str] = None    # page the image was found on, when the provider gives one
 
 
-SIZE_THRESHOLDS = {"any": 0, "hd": 1280, "fhd": 1920}
+SIZE_THRESHOLDS = {"any": 0, "hd": 1280, "fhd": 1920, "6k": 6000}
 
 
 def passes_size_filter(img: ImageResult, size: str, require_landscape: bool) -> bool:
@@ -151,7 +151,8 @@ def passes_size_filter(img: ImageResult, size: str, require_landscape: bool) -> 
     threshold = SIZE_THRESHOLDS.get(size, 0)
     if img.width <= 0 or img.height <= 0:
         return True
-    if threshold and img.width < threshold:
+    measured_dimension = max(img.width, img.height) if size == "6k" else img.width
+    if threshold and measured_dimension < threshold:
         return False
     if require_landscape and img.width < img.height:
         return False
@@ -1372,8 +1373,9 @@ CATEGORY_PROVIDER_PRIORITY = {
     "gif": ["giphy"],  # tenor removed: its API is fully decommissioned, see DEPRECATED_PROVIDERS
     "sfx": ["freesound"],
     "openverse": ["openverse"],
+    "puzzle": ["google", "serpapi", "pexels", "pixabay", "unsplash", "openverse"],
 }
-CATEGORY_ORDER = ["google", "pexels", "pixabay", "unsplash", "openverse", "anime", "gif", "sfx"]
+CATEGORY_ORDER = ["google", "pexels", "pixabay", "unsplash", "openverse", "puzzle", "anime", "gif", "sfx"]
 CATEGORY_BUTTON_LABELS = {
     "google": "🔎 Google",
     "pexels": "📷 Pexels",
@@ -1383,6 +1385,7 @@ CATEGORY_BUTTON_LABELS = {
     "gif": "🎞 GIF",
     "sfx": "🔊 SFX",
     "openverse": "🌐 Openverse",
+    "puzzle": "🧩 Puzzle Images (6K+)",
 }
 PLAIN_TEXT_COUNT = 10  # default per-category batch size (overridden by the count step)
 
@@ -1603,7 +1606,8 @@ async def handle_wizard_button(update: Update, context: ContextTypes.DEFAULT_TYP
                     return
 
                 status_msg = await context.bot.send_message(chat_id=chat_id, text=f"[{cat}] starting…")
-                await run_search_job(context, chat_id, query, PLAIN_TEXT_COUNT, provider, {}, status_msg, label=cat)
+                extra = {"size": "6k"} if cat == "puzzle" else {}
+                await run_search_job(context, chat_id, query, PLAIN_TEXT_COUNT, provider, extra, status_msg, label=cat)
 
             await asyncio.gather(*[run_one(cat, provider) for cat, provider in plan])
             PENDING_SEARCHES.pop(search_id, None)
@@ -1615,6 +1619,12 @@ async def handle_wizard_button(update: Update, context: ContextTypes.DEFAULT_TYP
             return
         entry["category"] = value
         entry["provider"] = provider
+
+        if value == "puzzle":
+            # Puzzle images always use the strict 6K+ filter.
+            keyboard = _wiz_kb([[(str(n), f"wz|count|{n}|{search_id}") for n in COUNT_OPTIONS]])
+            await cb.edit_message_text("🧩 Puzzle Images — only images at least 6,000 px on their longest side. How many results?", reply_markup=keyboard)
+            return
 
         if value == "anime":
             # One Anime button searches every anime provider in parallel.
@@ -1671,8 +1681,10 @@ async def handle_wizard_button(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if step == "count":
         entry["count"] = int(value)
-        if entry["category"] == "sfx":
-            # audio has no resolution -- skip straight to delivery
+        if entry["category"] in ("sfx", "puzzle"):
+            # Audio has no resolution; puzzle category fixes resolution at 6K+.
+            if entry["category"] == "puzzle":
+                entry["size"] = "6k"
             entry["size"] = "any"
             keyboard = _wiz_kb([[(label, f"wz|deliver|{val}|{search_id}") for label, val in DELIVERY_OPTIONS]])
             await cb.edit_message_text(f"[{entry['category']}] Deliver as:", reply_markup=keyboard)
