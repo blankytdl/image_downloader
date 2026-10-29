@@ -150,7 +150,7 @@ def passes_size_filter(img: ImageResult, size: str, require_landscape: bool) -> 
     """
     threshold = SIZE_THRESHOLDS.get(size, 0)
     if img.width <= 0 or img.height <= 0:
-        return True
+        return size != "6k"
     measured_dimension = max(img.width, img.height) if size == "6k" else img.width
     if threshold and measured_dimension < threshold:
         return False
