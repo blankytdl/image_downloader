@@ -1205,13 +1205,11 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Type a word or phrase (no command) and I'll show inline buttons for "
         "each configured source — Google, Pexels, Pixabay, Unsplash, Anime "
         "art, GIF, SFX, Openverse.\n"
-        "• Tap *Anime art* and pick a site — Safebooru, Danbooru (safe), "
-        "Yande.re, Konachan, or Waifu.im. Then type part of the character name; I look it up "
-        "against that site's own tag-autocomplete API and show you real "
-        "matching tags to pick from, so you don't have to guess underscore "
-        "formatting yourself. Results are always safe-rated only, even on "
-        "Yande.re/Konachan which otherwise host non-safe content. Sort "
-        "options: 🔥 Top (score), 🆕 New, 🎲 Random.\n"
+        "• Tap *Anime art* to search all five sources together — Safebooru, "
+        "Danbooru, Yande.re, Konachan, and Waifu.im. Choose a result count "
+        "per source; each provider runs in parallel with its own safe-rated "
+        "defaults. Yande.re/Konachan/Danbooru/Waifu.im are restricted to "
+        "safe content.\n"
         "• Tap *Pixabay*, *Unsplash*, *GIF*, or *SFX* for their own sort "
         "options (Popular/Latest, Trending/Best match); *Pexels*, *Google*, "
         "and *Openverse* skip straight to count since those APIs don't "
@@ -1603,11 +1601,10 @@ async def handle_wizard_button(update: Update, context: ContextTypes.DEFAULT_TYP
         entry["provider"] = provider
 
         if value == "anime":
-            # Which site? Each has its own tag-autocomplete API and sort
-            # vocabulary (see ANIME_SITE_AUTOCOMPLETE / ANIME_SITE_SORT_OPTIONS).
-            site_btns = [(label, f"wz|animesite|{val}|{search_id}") for label, val in ANIME_SITES]
-            keyboard = _wiz_kb([site_btns[i:i + 2] for i in range(0, len(site_btns), 2)])
-            await cb.edit_message_text("Which anime site?", reply_markup=keyboard)
+            # One Anime button searches every anime provider in parallel.
+            # Sort vocabularies differ, so each provider gets its own best default.
+            keyboard = _wiz_kb([[(str(n), f"wz|count|{n}|{search_id}") for n in COUNT_OPTIONS]])
+            await cb.edit_message_text("🎌 Anime — search all five sources. How many results per source?", reply_markup=keyboard)
             return
 
         if value in SORT_OPTIONS:
@@ -1676,16 +1673,37 @@ async def handle_wizard_button(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if step == "deliver":
         category = entry["category"]
-        provider = entry["provider"]
-        label = provider if category == "anime" else category
-        extra = {"sort": entry.get("sort"), "size": entry.get("size", "any")}
         count = entry.get("count", PLAIN_TEXT_COUNT)
+        size = entry.get("size", "any")
 
-        status_msg = await cb.edit_message_text(f"[{label}] 🔎 Searching for “{query}”…")
-        await run_search_job(
-            context, chat_id, query, count, provider, extra, status_msg,
-            label=label, delivery=value,
-        )
+        if category == "anime":
+            anime_providers = ["safebooru", "danbooru", "yandere", "konachan", "waifuim"]
+            await cb.edit_message_text(
+                f"🎌 Searching all five anime sources for “{query}” "
+                f"({count} results per source)…"
+            )
+
+            async def run_anime_provider(provider: str):
+                status_msg = await context.bot.send_message(
+                    chat_id=chat_id, text=f"[{provider}] starting…"
+                )
+                sort = "favorites" if provider == "waifuim" else "score"
+                await run_search_job(
+                    context, chat_id, query, count, provider,
+                    {"sort": sort, "size": size}, status_msg,
+                    label=provider, delivery=value,
+                )
+
+            await asyncio.gather(*(run_anime_provider(p) for p in anime_providers))
+        else:
+            provider = entry["provider"]
+            extra = {"sort": entry.get("sort"), "size": size}
+            status_msg = await cb.edit_message_text(f"[{category}] 🔎 Searching for “{query}”…")
+            await run_search_job(
+                context, chat_id, query, count, provider, extra, status_msg,
+                label=category, delivery=value,
+            )
+
         PENDING_SEARCHES.pop(search_id, None)
         return
 
