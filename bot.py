@@ -1651,11 +1651,18 @@ async def handle_wizard_button(update: Update, context: ContextTypes.DEFAULT_TYP
         entry["category"] = value
         entry["provider"] = provider
 
-        if value in ("anime", "puzzle"):
+        if value == "anime":
+            site_buttons = [(label, f"wz|animesite|{site}|{search_id}") for label, site in ANIME_SITES]
+            keyboard = _wiz_kb([site_buttons[i:i + 2] for i in range(0, len(site_buttons), 2)])
+            await cb.edit_message_text(
+                "Choose an individual anime source, or the separate random-source option:",
+                reply_markup=keyboard,
+            )
+            return
+        if value == "puzzle":
             entry["sort"] = "relevance"
             keyboard = _wiz_kb([[(str(n), f"wz|count|{n}|{search_id}") for n in COUNT_OPTIONS]])
-            prompt = "How many anime results across all five sites?" if value == "anime" else "How many 6K+ anime puzzle images?"
-            await cb.edit_message_text(prompt, reply_markup=keyboard)
+            await cb.edit_message_text("How many 6K+ anime puzzle images?", reply_markup=keyboard)
             return
 
         if value in SORT_OPTIONS:
