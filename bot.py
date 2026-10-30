@@ -1253,9 +1253,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Type a word or phrase (no command) and I'll show inline buttons for "
         "each configured source — Google, Pexels, Pixabay, Unsplash, Anime "
         "art, GIF, SFX, Openverse.\n"
-        "• *Anime art* searches all five anime sources (Safebooru, Danbooru "
-        "safe, Yande.re, Konachan, and Waifu.im) from one button. Each site "
-        "runs independently, so one provider failing does not stop the others.\n"
+        "• *Anime art* opens separate buttons for Safebooru, Danbooru "
+        "safe, Yande.re, Konachan, and Waifu.im, plus one Random button that "
+        "mixes results from all five sources.\n"
         "• *Anime Puzzle Images (6K+)* is a separate anime-only search across "
         "those same five sources. The longest side must be at least 6,000 px "
         "by default; unknown dimensions are rejected.\n"
@@ -1282,8 +1282,11 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/providers — list which providers have API keys configured\n\n"
         "*Stock photos* (pexels/pixabay/unsplash): filtered to landscape, "
         f"≥{MIN_WIDTH_FOR_YOUTUBE}px wide by default.\n"
-        "*Anime art / Puzzle Images*: all five anime sources are searched "
-        "together; puzzle mode requires a 6K+ longest side. No key needed.\n"
+        "*Anime art*: choose one provider or use Random to mix all five. "
+        "Anime resolution filters include 6K+, 8K+, 10K+, and 12K+ (longest "
+        "side); high-resolution searches request a larger candidate pool. "
+        "*Puzzle Images* searches all five sources and requires a 6K+ longest "
+        "side. No key needed.\n"
         "  e.g. `/search hatsune_miku 20 yandere type:png minscore:80`\n"
         "*GIFs* (giphy): free API key. Tenor's API was fully shut down by "
         "Google on 2026-06-30 and no longer works.\n"
@@ -1448,8 +1451,8 @@ SORT_OPTIONS = {
     "sfx": [("🔥 Popular", "popular"), ("🆕 Newest", "new"), ("🔍 Best match", "relevance")],
 }
 
-# Kept for the legacy per-provider tag-autocomplete flow; the category
-# buttons now search all five providers together.
+# Anime art opens this provider picker. Each provider is independent;
+# the final option deliberately mixes results from all five sources.
 ANIME_SITES = [
     ("🎌 Safebooru", "safebooru"),
     ("🅳 Danbooru (safe)", "danbooru"),
@@ -1833,9 +1836,16 @@ async def run_search_job(
                 # pre-filter by type from the URL alone -- overfetch candidates
                 # and filter by the real, sniffed type after downloading instead.
                 needs_post_filter = bool(file_type) and provider in WEB_ENGINE_PROVIDERS
-                fetch_n = count * 3 if needs_post_filter else count
+                # 6K+ sources are rare in anime catalogs. Ask each provider
+                # for a much larger candidate pool before applying the dimension
+                # filter; otherwise a normal 5-30 result page almost never
+                # contains a qualifying original even when the site has one.
+                if size in ANIME_HIGH_RES_SIZES and provider not in WEB_ENGINE_PROVIDERS:
+                    fetch_n = 34  # booru APIs cap at 100 (usually count * 3); this requests that ceiling
+                else:
+                    fetch_n = count * 3 if needs_post_filter else count
                 raw_results = await search_fn(session, query, fetch_n, **extra)
-                logger.info("[%s/%s] %d raw results for %r", label, provider, len(raw_results), query)
+                logger.info("[%s/%s] %d raw candidates for %r (size=%s)", label, provider, len(raw_results), query, size)
 
                 if needs_post_filter:
                     typed = raw_results  # can't judge type yet; filter after download
@@ -1844,6 +1854,8 @@ async def run_search_job(
 
                 require_landscape = provider not in SKIP_ORIENTATION_FILTER
                 filtered = [r for r in typed if passes_size_filter(r, size, require_landscape)]
+                if size in ANIME_HIGH_RES_SIZES:
+                    logger.info("[%s/%s] %d/%d candidates meet %s threshold", label, provider, len(filtered), len(typed), size)
                 if not filtered and size not in ANIME_HIGH_RES_SIZES:
                     filtered = typed
 
