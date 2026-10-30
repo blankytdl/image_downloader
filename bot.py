@@ -1824,8 +1824,14 @@ async def run_search_job(
         # every candidate before filtering by real sniffed type, so pad the
         # timeout for that case instead of sizing it off the requested count.
         needs_post_filter_estimate = bool(file_type) and provider in WEB_ENGINE_PROVIDERS
-        effective_count = count * 3 if needs_post_filter_estimate else count
-        job_timeout = 20 + effective_count * 8  # scales with batch size; generous but finite
+        is_anime_high_res = size in ANIME_HIGH_RES_SIZES
+        # High-resolution verification may need to download a larger candidate
+        # pool because provider dimensions are sometimes missing or inaccurate.
+        effective_count = (
+            min(max(count * 5, 30), 100) if is_anime_high_res
+            else count * 3 if needs_post_filter_estimate else count
+        )
+        job_timeout = 30 + effective_count * 8  # scales with actual candidate batch
 
         async def _do_job():
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT), headers=HTTP_HEADERS) as session:
@@ -1855,11 +1861,21 @@ async def run_search_job(
                 require_landscape = provider not in SKIP_ORIENTATION_FILTER
                 filtered = [r for r in typed if passes_size_filter(r, size, require_landscape)]
                 if size in ANIME_HIGH_RES_SIZES:
-                    logger.info("[%s/%s] %d/%d candidates meet %s threshold", label, provider, len(filtered), len(typed), size)
-                if not filtered and size not in ANIME_HIGH_RES_SIZES:
-                    filtered = typed
-
-                chosen = filtered[: (count * 3 if needs_post_filter else count)]
+                    # Do not trust booru metadata as the final authority: some
+                    # providers omit dimensions or report preview dimensions.
+                    # Download a bounded candidate pool and inspect each actual
+                    # image file below before accepting it.
+                    candidate_limit = min(max(count * 5, 30), 100)
+                    chosen = typed[:candidate_limit]
+                    logger.info(
+                        "[%s/%s] %d candidates queued for on-disk %s verification "
+                        "(%d metadata-qualified out of %d)",
+                        label, provider, len(chosen), size, len(filtered), len(typed),
+                    )
+                else:
+                    if not filtered:
+                        filtered = typed
+                    chosen = filtered[: (count * 3 if needs_post_filter else count)]
 
                 if not chosen:
                     msg = f"[{label}] No results found for “{query}”"
@@ -1879,6 +1895,31 @@ async def run_search_job(
                 failures = len(downloaded) - len(paths)
                 if failures:
                     logger.warning("[%s/%s] %d/%d downloads failed", label, provider, failures, len(downloaded))
+
+                if size in ANIME_HIGH_RES_SIZES:
+                    verified = []
+                    rejected = 0
+                    for path in paths:
+                        try:
+                            with Image.open(path) as actual:
+                                width, height = actual.size
+                                if max(width, height) >= SIZE_THRESHOLDS[size]:
+                                    verified.append(path)
+                                else:
+                                    rejected += 1
+                                    os.remove(path)
+                        except Exception as exc:
+                            rejected += 1
+                            logger.warning("[%s/%s] Could not verify image dimensions for %s: %s", label, provider, os.path.basename(path), exc)
+                            try:
+                                os.remove(path)
+                            except OSError:
+                                pass
+                    paths = verified[:count]
+                    logger.info(
+                        "[%s/%s] Actual-file dimension check: %d passed, %d rejected for %s",
+                        label, provider, len(paths), rejected, size,
+                    )
 
                 if needs_post_filter:
                     wanted_ext = file_type.lower().lstrip(".")
