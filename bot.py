@@ -32,7 +32,6 @@ import logging
 import math
 import os
 import re
-import random
 import shutil
 import tempfile
 import time
@@ -140,8 +139,7 @@ class ImageResult:
 
 ANIME_PUZZLE_MIN_DIMENSION = max(1, int(os.getenv("ANIME_PUZZLE_MIN_DIMENSION", "6000")))
 TELEGRAM_PHOTO_SIZE_LIMIT = 10 * 1024 * 1024  # Telegram sendPhoto limit
-SIZE_THRESHOLDS = {"any": 0, "hd": 1280, "fhd": 1920, "6k": ANIME_PUZZLE_MIN_DIMENSION, "8k": 8000, "10k": 10000, "12k": 12000}
-ANIME_HIGH_RES_SIZES = {"6k", "8k", "10k", "12k"}
+SIZE_THRESHOLDS = {"any": 0, "hd": 1280, "fhd": 1920, "6k": ANIME_PUZZLE_MIN_DIMENSION}
 
 
 def passes_size_filter(img: ImageResult, size: str, require_landscape: bool) -> bool:
@@ -152,9 +150,8 @@ def passes_size_filter(img: ImageResult, size: str, require_landscape: bool) -> 
     """
     threshold = SIZE_THRESHOLDS.get(size, 0)
     if img.width <= 0 or img.height <= 0:
-        return size not in ANIME_HIGH_RES_SIZES
-    measured = max(img.width, img.height) if size in ANIME_HIGH_RES_SIZES else img.width
-    if threshold and measured < threshold:
+        return size != "6k"
+    if threshold and (max(img.width, img.height) if size == "6k" else img.width) < threshold:
         return False
     if require_landscape and img.width < img.height:
         return False
@@ -861,51 +858,6 @@ async def search_freesound(session: aiohttp.ClientSession, query: str, count: in
     return results
 
 
-async def search_anime_random(session: aiohttp.ClientSession, query: str, count: int, **kwargs) -> List[ImageResult]:
-    """Randomly interleave images from the five anime providers."""
-    sources = [
-        ("safebooru", search_safebooru),
-        ("danbooru", search_danbooru_safe),
-        ("yandere", search_yandere),
-        ("konachan", search_konachan),
-        ("waifuim", search_waifu_im),
-    ]
-    async def fetch_one(name, fn):
-        q = query
-        autocomplete = ANIME_SITE_AUTOCOMPLETE.get(name)
-        if autocomplete:
-            try:
-                tags = await autocomplete_with_fallbacks(autocomplete, query, limit=1)
-                if tags:
-                    q = tags[0]
-                elif "," not in query:
-                    q = query.replace(" ", "_")
-            except Exception:
-                logger.debug("Anime autocomplete failed for %s", name, exc_info=True)
-        try:
-            results = await fn(session, q, max(count * 2, 10), sort="random")
-            random.shuffle(results)
-            return results
-        except Exception:
-            logger.warning("Random anime provider %s failed", name, exc_info=True)
-            return []
-    batches = await asyncio.gather(*(fetch_one(n, fn) for n, fn in sources), return_exceptions=True)
-    batches = [b for b in batches if isinstance(b, list) and b]
-    mixed = []
-    while batches and len(mixed) < count * 5:
-        random.shuffle(batches)
-        rest = []
-        for batch in batches:
-            if batch:
-                mixed.append(batch.pop())
-            if batch:
-                rest.append(batch)
-            if len(mixed) >= count * 5:
-                break
-        batches = rest
-    return mixed
-
-
 PROVIDERS = {
     "pexels": search_pexels,
     "pixabay": search_pixabay,
@@ -921,7 +873,6 @@ PROVIDERS = {
     "danbooru": search_danbooru_safe,
     "waifuim": search_waifu_im,
     "freesound": search_freesound,
-    "anime_random": search_anime_random,
 }
 
 # Providers that are still selectable (so /search gives an accurate reason
@@ -936,7 +887,7 @@ DEPRECATED_PROVIDERS = {
 
 # Providers whose art is often portrait-oriented (character shots, GIFs,
 # overlay PNGs) -- skip the landscape/hi-res "youtube_friendly" filter for these.
-SKIP_ORIENTATION_FILTER = {"safebooru", "yandere", "konachan", "danbooru", "waifuim", "anime_random", "giphy", "tenor", "freesound"}
+SKIP_ORIENTATION_FILTER = {"safebooru", "yandere", "konachan", "danbooru", "waifuim", "giphy", "tenor", "freesound"}
 
 
 def configured_providers() -> List[str]:
@@ -1253,9 +1204,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Type a word or phrase (no command) and I'll show inline buttons for "
         "each configured source — Google, Pexels, Pixabay, Unsplash, Anime "
         "art, GIF, SFX, Openverse.\n"
-        "• *Anime art* opens separate buttons for Safebooru, Danbooru "
-        "safe, Yande.re, Konachan, and Waifu.im, plus one Random button that "
-        "mixes results from all five sources.\n"
+        "• *Anime art* searches all five anime sources (Safebooru, Danbooru "
+        "safe, Yande.re, Konachan, and Waifu.im) from one button. Each site "
+        "runs independently, so one provider failing does not stop the others.\n"
         "• *Anime Puzzle Images (6K+)* is a separate anime-only search across "
         "those same five sources. The longest side must be at least 6,000 px "
         "by default; unknown dimensions are rejected.\n"
@@ -1282,11 +1233,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/providers — list which providers have API keys configured\n\n"
         "*Stock photos* (pexels/pixabay/unsplash): filtered to landscape, "
         f"≥{MIN_WIDTH_FOR_YOUTUBE}px wide by default.\n"
-        "*Anime art*: choose one provider or use Random to mix all five. "
-        "Anime resolution filters include 6K+, 8K+, 10K+, and 12K+ (longest "
-        "side); high-resolution searches request a larger candidate pool. "
-        "*Puzzle Images* searches all five sources and requires a 6K+ longest "
-        "side. No key needed.\n"
+        "*Anime art / Puzzle Images*: all five anime sources are searched "
+        "together; puzzle mode requires a 6K+ longest side. No key needed.\n"
         "  e.g. `/search hatsune_miku 20 yandere type:png minscore:80`\n"
         "*GIFs* (giphy): free API key. Tenor's API was fully shut down by "
         "Google on 2026-06-30 and no longer works.\n"
@@ -1433,7 +1381,7 @@ CATEGORY_BUTTON_LABELS = {
     "pexels": "📷 Pexels",
     "pixabay": "🖼 Pixabay",
     "unsplash": "📸 Unsplash",
-    "anime": "🎌 Anime art",
+    "anime": "🎌 Anime art (all 5 sites)",
     "puzzle": "🧩 Anime Puzzle Images (6K+)",
     "gif": "🎞 GIF",
     "sfx": "🔊 SFX",
@@ -1451,15 +1399,14 @@ SORT_OPTIONS = {
     "sfx": [("🔥 Popular", "popular"), ("🆕 Newest", "new"), ("🔍 Best match", "relevance")],
 }
 
-# Anime art opens this provider picker. Each provider is independent;
-# the final option deliberately mixes results from all five sources.
+# Kept for the legacy per-provider tag-autocomplete flow; the category
+# buttons now search all five providers together.
 ANIME_SITES = [
     ("🎌 Safebooru", "safebooru"),
     ("🅳 Danbooru (safe)", "danbooru"),
     ("🌸 Yande.re", "yandere"),
     ("🎨 Konachan", "konachan"),
     ("💫 Waifu.im", "waifuim"),
-    ("🎲 Random across anime sources", "anime_random"),
 ]
 ANIME_SITE_AUTOCOMPLETE = {
     "safebooru": safebooru_autocomplete,
@@ -1478,7 +1425,6 @@ ANIME_SITE_SORT_OPTIONS = {
 
 COUNT_OPTIONS = [5, 10, 15, 20, 30]
 SIZE_OPTIONS = [("Any size", "any"), ("HD (≥1280px)", "hd"), ("Full HD (≥1920px)", "fhd")]
-ANIME_SIZE_OPTIONS = [("6K+ (≥6000px)", "6k"), ("8K+ (≥8000px)", "8k"), ("10K+ (≥10000px)", "10k"), ("12K+ (≥12000px)", "12k")]
 DELIVERY_OPTIONS = [("📦 Zip file", "zip"), ("🖼 Send individually", "individual")]
 
 # Pending searches waiting on the next button tap or text reply:
@@ -1602,6 +1548,9 @@ async def handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     search_id = _new_pending(text)
     row = [(CATEGORY_BUTTON_LABELS[cat], f"wz|cat|{cat}|{search_id}") for cat, _ in plan]
     rows = [row[i:i + 2] for i in range(0, len(row), 2)]  # 2 buttons per row
+    if len(plan) > 1:
+        rows.append([("📦 All of the above", f"wz|cat|all|{search_id}")])
+
     msg = f"What would you like for “{text}”?"
     if missing:
         msg += f"\n(not shown: {', '.join(missing)} — no API key configured)"
@@ -1651,18 +1600,11 @@ async def handle_wizard_button(update: Update, context: ContextTypes.DEFAULT_TYP
         entry["category"] = value
         entry["provider"] = provider
 
-        if value == "anime":
-            site_buttons = [(label, f"wz|animesite|{site}|{search_id}") for label, site in ANIME_SITES]
-            keyboard = _wiz_kb([site_buttons[i:i + 2] for i in range(0, len(site_buttons), 2)])
-            await cb.edit_message_text(
-                "Choose an individual anime source, or the separate random-source option:",
-                reply_markup=keyboard,
-            )
-            return
-        if value == "puzzle":
+        if value in ("anime", "puzzle"):
             entry["sort"] = "relevance"
             keyboard = _wiz_kb([[(str(n), f"wz|count|{n}|{search_id}") for n in COUNT_OPTIONS]])
-            await cb.edit_message_text("How many 6K+ anime puzzle images?", reply_markup=keyboard)
+            prompt = "How many anime results across all five sites?" if value == "anime" else "How many 6K+ anime puzzle images?"
+            await cb.edit_message_text(prompt, reply_markup=keyboard)
             return
 
         if value in SORT_OPTIONS:
@@ -1678,12 +1620,9 @@ async def handle_wizard_button(update: Update, context: ContextTypes.DEFAULT_TYP
     if step == "animesite":
         site = value
         entry["provider"] = site
-        if site == "anime_random":
-            entry["sort"] = "random"
-            keyboard = _wiz_kb([[(str(n), f"wz|count|{n}|{search_id}") for n in COUNT_OPTIONS]])
-            await cb.edit_message_text("🎲 Random mix from all available anime sources. How many images?", reply_markup=keyboard)
-            return
-        # Individual anime providers keep their own tag autocomplete.
+        # All three sites use strict/literal booru tag matching (no
+        # natural-language fuzzy matching), so look up real tags via that
+        # site's own autocomplete API before running anything.
         context.chat_data["awaiting_anime_tag"] = search_id
         site_label = dict(ANIME_SITES).get(site, site)
         await cb.edit_message_text(
@@ -1722,8 +1661,7 @@ async def handle_wizard_button(update: Update, context: ContextTypes.DEFAULT_TYP
             keyboard = _wiz_kb([[(label, f"wz|deliver|{val}|{search_id}") for label, val in DELIVERY_OPTIONS]])
             await cb.edit_message_text(f"[{entry['category']}] Deliver as:", reply_markup=keyboard)
             return
-        size_options = SIZE_OPTIONS + (ANIME_SIZE_OPTIONS if entry["category"] == "anime" else [])
-        keyboard = _wiz_kb([[(label, f"wz|size|{val}|{search_id}") for label, val in size_options]])
+        keyboard = _wiz_kb([[(label, f"wz|size|{val}|{search_id}") for label, val in SIZE_OPTIONS]])
         await cb.edit_message_text(f"[{entry['category']}] Minimum resolution?", reply_markup=keyboard)
         return
 
@@ -1740,18 +1678,13 @@ async def handle_wizard_button(update: Update, context: ContextTypes.DEFAULT_TYP
         extra = {"size": "6k" if category == "puzzle" else entry.get("size", "any")}
         count = entry.get("count", PLAIN_TEXT_COUNT)
 
-        if category == "puzzle":
-            status_msg = await cb.edit_message_text(f"[{label}] 🔎 Searching anime sources for 6K+ puzzle images matching “{query}”…")
+        status_msg = await cb.edit_message_text(f"[{label}] 🔎 Searching all five anime sources for “{query}”…")
+        if category in ("anime", "puzzle"):
             await run_anime_group_job(context, chat_id, query, count, extra, status_msg, category, value)
         else:
-            # Anime category buttons are provider-specific: run ONLY the
-            # selected provider. The extra anime_random button is the sole
-            # option that intentionally searches across multiple providers.
-            site_label = dict(ANIME_SITES).get(provider, provider)
-            status_msg = await cb.edit_message_text(f"[{site_label}] 🔎 Searching {site_label} for “{query}”…")
             await run_search_job(
                 context, chat_id, query, count, provider, extra, status_msg,
-                label=provider, delivery=value,
+                label=label, delivery=value,
             )
         PENDING_SEARCHES.pop(search_id, None)
         return
@@ -1824,14 +1757,8 @@ async def run_search_job(
         # every candidate before filtering by real sniffed type, so pad the
         # timeout for that case instead of sizing it off the requested count.
         needs_post_filter_estimate = bool(file_type) and provider in WEB_ENGINE_PROVIDERS
-        is_anime_high_res = size in ANIME_HIGH_RES_SIZES
-        # High-resolution verification may need to download a larger candidate
-        # pool because provider dimensions are sometimes missing or inaccurate.
-        effective_count = (
-            min(max(count * 5, 30), 100) if is_anime_high_res
-            else count * 3 if needs_post_filter_estimate else count
-        )
-        job_timeout = 30 + effective_count * 8  # scales with actual candidate batch
+        effective_count = count * 3 if needs_post_filter_estimate else count
+        job_timeout = 20 + effective_count * 8  # scales with batch size; generous but finite
 
         async def _do_job():
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT), headers=HTTP_HEADERS) as session:
@@ -1842,16 +1769,9 @@ async def run_search_job(
                 # pre-filter by type from the URL alone -- overfetch candidates
                 # and filter by the real, sniffed type after downloading instead.
                 needs_post_filter = bool(file_type) and provider in WEB_ENGINE_PROVIDERS
-                # 6K+ sources are rare in anime catalogs. Ask each provider
-                # for a much larger candidate pool before applying the dimension
-                # filter; otherwise a normal 5-30 result page almost never
-                # contains a qualifying original even when the site has one.
-                if size in ANIME_HIGH_RES_SIZES and provider not in WEB_ENGINE_PROVIDERS:
-                    fetch_n = 34  # booru APIs cap at 100 (usually count * 3); this requests that ceiling
-                else:
-                    fetch_n = count * 3 if needs_post_filter else count
+                fetch_n = count * 3 if needs_post_filter else count
                 raw_results = await search_fn(session, query, fetch_n, **extra)
-                logger.info("[%s/%s] %d raw candidates for %r (size=%s)", label, provider, len(raw_results), query, size)
+                logger.info("[%s/%s] %d raw results for %r", label, provider, len(raw_results), query)
 
                 if needs_post_filter:
                     typed = raw_results  # can't judge type yet; filter after download
@@ -1860,22 +1780,10 @@ async def run_search_job(
 
                 require_landscape = provider not in SKIP_ORIENTATION_FILTER
                 filtered = [r for r in typed if passes_size_filter(r, size, require_landscape)]
-                if size in ANIME_HIGH_RES_SIZES:
-                    # Do not trust booru metadata as the final authority: some
-                    # providers omit dimensions or report preview dimensions.
-                    # Download a bounded candidate pool and inspect each actual
-                    # image file below before accepting it.
-                    candidate_limit = min(max(count * 5, 30), 100)
-                    chosen = typed[:candidate_limit]
-                    logger.info(
-                        "[%s/%s] %d candidates queued for on-disk %s verification "
-                        "(%d metadata-qualified out of %d)",
-                        label, provider, len(chosen), size, len(filtered), len(typed),
-                    )
-                else:
-                    if not filtered:
-                        filtered = typed
-                    chosen = filtered[: (count * 3 if needs_post_filter else count)]
+                if not filtered and size != "6k":
+                    filtered = typed
+
+                chosen = filtered[: (count * 3 if needs_post_filter else count)]
 
                 if not chosen:
                     msg = f"[{label}] No results found for “{query}”"
@@ -1896,31 +1804,6 @@ async def run_search_job(
                 if failures:
                     logger.warning("[%s/%s] %d/%d downloads failed", label, provider, failures, len(downloaded))
 
-                if size in ANIME_HIGH_RES_SIZES:
-                    verified = []
-                    rejected = 0
-                    for path in paths:
-                        try:
-                            with Image.open(path) as actual:
-                                width, height = actual.size
-                                if max(width, height) >= SIZE_THRESHOLDS[size]:
-                                    verified.append(path)
-                                else:
-                                    rejected += 1
-                                    os.remove(path)
-                        except Exception as exc:
-                            rejected += 1
-                            logger.warning("[%s/%s] Could not verify image dimensions for %s: %s", label, provider, os.path.basename(path), exc)
-                            try:
-                                os.remove(path)
-                            except OSError:
-                                pass
-                    paths = verified[:count]
-                    logger.info(
-                        "[%s/%s] Actual-file dimension check: %d passed, %d rejected for %s",
-                        label, provider, len(paths), rejected, size,
-                    )
-
                 if needs_post_filter:
                     wanted_ext = file_type.lower().lstrip(".")
                     wanted_set = {"jpg", "jpeg"} if wanted_ext in ("jpg", "jpeg") else {wanted_ext}
@@ -1929,17 +1812,10 @@ async def run_search_job(
                 paths = paths[:count]
 
             if not paths:
-                if size in ANIME_HIGH_RES_SIZES and 'rejected' in locals() and rejected:
-                    msg = (
-                        f"[{label}] Downloaded {len(chosen)} candidates, but none had an "
-                        f"actual image dimension of at least {SIZE_THRESHOLDS[size]:,} px "
-                        f"on the longest side ({rejected} rejected). Try another tag or provider."
-                    )
-                else:
-                    msg = f"[{label}] All {failures or len(chosen)} downloads failed."
-                    if needs_post_filter:
-                        msg = f"[{label}] None of the results were actually {file_type} files after downloading."
-                await status_msg.edit_text(msg)
+                msg = f"[{label}] All {failures or len(chosen)} downloads failed."
+                if needs_post_filter:
+                    msg = f"[{label}] None of the results were actually {file_type} files after downloading."
+                await status_msg.edit_text(msg + " Try a different query or provider.")
                 return
 
             safe_query = re.sub(r"[^a-zA-Z0-9]+", "_", query)[:30]
