@@ -137,25 +137,21 @@ class ImageResult:
     source_page: Optional[str] = None    # page the image was found on, when the provider gives one
 
 
-# Puzzle-image search is anime-only and uses the longest side, not width alone.
-# Set ANIME_PUZZLE_MIN_DIMENSION to change the default 6K threshold.
 ANIME_PUZZLE_MIN_DIMENSION = max(1, int(os.getenv("ANIME_PUZZLE_MIN_DIMENSION", "6000")))
+TELEGRAM_PHOTO_SIZE_LIMIT = 10 * 1024 * 1024  # Telegram sendPhoto limit
 SIZE_THRESHOLDS = {"any": 0, "hd": 1280, "fhd": 1920, "6k": ANIME_PUZZLE_MIN_DIMENSION}
 
 
 def passes_size_filter(img: ImageResult, size: str, require_landscape: bool) -> bool:
     """
-    `size` is one of SIZE_THRESHOLDS's keys and sets a minimum width.
-    `require_landscape` additionally requires width >= height -- used for
-    stock-photo providers (video-editing B-roll), but skipped for booru/GIF
-    sources where portrait art and square/odd-aspect GIFs are normal.
-    Unknown dimensions (0) always pass, since we can't judge them.
+    Normal sizes use a minimum width. The anime-only 6K puzzle filter uses
+    the longest side so portrait and landscape art both qualify. Unknown
+    dimensions are rejected for 6K because the threshold cannot be verified.
     """
     threshold = SIZE_THRESHOLDS.get(size, 0)
     if img.width <= 0 or img.height <= 0:
         return size != "6k"
-    measured_dimension = max(img.width, img.height) if size == "6k" else img.width
-    if threshold and measured_dimension < threshold:
+    if threshold and (max(img.width, img.height) if size == "6k" else img.width) < threshold:
         return False
     if require_landscape and img.width < img.height:
         return False
@@ -1001,27 +997,25 @@ def chunk_by_size(paths: List[str], limit_bytes: int) -> List[List[str]]:
 
 
 PHOTO_EXTS = {"jpg", "jpeg", "png", "webp"}
-TELEGRAM_PHOTO_SIZE_LIMIT = 10 * 1024 * 1024  # Telegram sendPhoto limit: 10 MiB
 
 
 async def send_single_file(context: ContextTypes.DEFAULT_TYPE, chat_id: int, path: str, caption: str):
-    """Send a downloaded file using the best Telegram method for its type.
-
-    Telegram limits sendPhoto uploads to 10 MiB. Larger image files are sent
-    as documents instead, preserving the original file and avoiding a
-    BadRequest that would otherwise interrupt the batch.
-    """
+    """Send one downloaded file as its own message, picking the Telegram
+    send method that gives the best inline preview for its type: animated
+    playback for GIFs, an inline image for common photo formats, an inline
+    audio player for sound effects, and a plain document for anything else
+    (bmp/tiff/svg/etc)."""
     ext = path.rsplit(".", 1)[-1].lower()
-    file_size = os.path.getsize(path)
     with open(path, "rb") as f:
         if ext == "gif":
             await context.bot.send_animation(chat_id=chat_id, animation=f, caption=caption)
-        elif ext in PHOTO_EXTS and file_size <= TELEGRAM_PHOTO_SIZE_LIMIT:
+        elif ext in PHOTO_EXTS and os.path.getsize(path) <= TELEGRAM_PHOTO_SIZE_LIMIT:
             await context.bot.send_photo(chat_id=chat_id, photo=f, caption=caption)
+        elif ext in PHOTO_EXTS:
+            await context.bot.send_document(chat_id=chat_id, document=f, caption=caption)
         elif ext in AUDIO_EXTS:
             await context.bot.send_audio(chat_id=chat_id, audio=f, caption=caption)
         else:
-            # Includes oversized JPG/PNG/WebP files: send unchanged as a document.
             await context.bot.send_document(chat_id=chat_id, document=f, caption=caption)
 
 
@@ -1031,9 +1025,10 @@ async def send_single_file(context: ContextTypes.DEFAULT_TYPE, chat_id: int, pat
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Just send me a word or phrase and I'll show you 4 buttons — "
-        "Google, Stock photos, Safebooru (anime), and GIF. Tap one and I'll "
-        "walk you through sort order, count, resolution, and delivery "
+        "👋 Just send me a word or phrase and I'll show category buttons — "
+        "Google, stock photos, Anime art (all five sites), Anime Puzzle "
+        "Images (6K+), GIF, SFX, and Openverse. Tap one and I'll "
+        "walk you through count, resolution where applicable, and delivery "
         "(zip or send individually) — or tap \"All of the above\" for a "
         "quick run with defaults.\n\n"
         "For more control, use:\n"
@@ -1209,17 +1204,19 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Type a word or phrase (no command) and I'll show inline buttons for "
         "each configured source — Google, Pexels, Pixabay, Unsplash, Anime "
         "art, GIF, SFX, Openverse.\n"
-        "• Tap *Anime art* to search all five sources together — Safebooru, "
-        "Danbooru, Yande.re, Konachan, and Waifu.im. Choose a result count "
-        "per source; each provider runs in parallel with its own safe-rated "
-        "defaults. Yande.re/Konachan/Danbooru/Waifu.im are restricted to "
-        "safe content.\n"
+        "• *Anime art* searches all five anime sources (Safebooru, Danbooru "
+        "safe, Yande.re, Konachan, and Waifu.im) from one button. Each site "
+        "runs independently, so one provider failing does not stop the others.\n"
+        "• *Anime Puzzle Images (6K+)* is a separate anime-only search across "
+        "those same five sources. The longest side must be at least 6,000 px "
+        "by default; unknown dimensions are rejected.\n"
         "• Tap *Pixabay*, *Unsplash*, *GIF*, or *SFX* for their own sort "
         "options (Popular/Latest, Trending/Best match); *Pexels*, *Google*, "
         "and *Openverse* skip straight to count since those APIs don't "
         "support ordering results.\n"
         "• Every category then asks for count (5-30), minimum resolution "
-        "(Any / HD / Full HD -- ignored for SFX), and delivery — 📦 one zip "
+        "(Any / HD / Full HD -- ignored for SFX; Puzzle Images is fixed at "
+        "6K+), and delivery — 📦 one zip "
         "file, or 🖼 sent as individual messages.\n"
         "• Tap *All of the above* to skip the wizard and get every "
         "configured category at once with default settings.\n\n"
@@ -1236,8 +1233,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/providers — list which providers have API keys configured\n\n"
         "*Stock photos* (pexels/pixabay/unsplash): filtered to landscape, "
         f"≥{MIN_WIDTH_FOR_YOUTUBE}px wide by default.\n"
-        "*Anime art* (safebooru/danbooru/yandere/konachan/waifuim): tag "
-        "search, safe-rated only (forced, not optional), no key needed.\n"
+        "*Anime art / Puzzle Images*: all five anime sources are searched "
+        "together; puzzle mode requires a 6K+ longest side. No key needed.\n"
         "  e.g. `/search hatsune_miku 20 yandere type:png minscore:80`\n"
         "*GIFs* (giphy): free API key. Tenor's API was fully shut down by "
         "Google on 2026-06-30 and no longer works.\n"
@@ -1373,34 +1370,28 @@ CATEGORY_PROVIDER_PRIORITY = {
     # picker (see ANIME_SITES below) since all three need no API key and so
     # would otherwise always resolve to the first one, silently.
     "anime": ["safebooru", "danbooru", "yandere", "konachan", "waifuim"],
+    "puzzle": ["safebooru", "danbooru", "yandere", "konachan", "waifuim"],
     "gif": ["giphy"],  # tenor removed: its API is fully decommissioned, see DEPRECATED_PROVIDERS
     "sfx": ["freesound"],
     "openverse": ["openverse"],
-    "puzzle": ["safebooru", "danbooru", "yandere", "konachan", "waifuim"],
 }
-CATEGORY_ORDER = ["google", "pexels", "pixabay", "unsplash", "openverse", "puzzle", "anime", "gif", "sfx"]
+CATEGORY_ORDER = ["google", "pexels", "pixabay", "unsplash", "openverse", "anime", "puzzle", "gif", "sfx"]
 CATEGORY_BUTTON_LABELS = {
     "google": "🔎 Google",
     "pexels": "📷 Pexels",
     "pixabay": "🖼 Pixabay",
     "unsplash": "📸 Unsplash",
-    "anime": "🎌 Anime art",
+    "anime": "🎌 Anime art (all 5 sites)",
+    "puzzle": "🧩 Anime Puzzle Images (6K+)",
     "gif": "🎞 GIF",
     "sfx": "🔊 SFX",
     "openverse": "🌐 Openverse",
-    "puzzle": "🧩 Puzzle Images (6K+)",
 }
 PLAIN_TEXT_COUNT = 10  # default per-category batch size (overridden by the count step)
 
-# Sort options offered per category, as (button label, value) pairs. A
-# category with no entry here skips the sort step entirely -- Pexels' API
-# has no ordering parameter at all (previously this bot silently re-routed
-# a "Latest" pick to Pixabay/Unsplash to work around that; splitting Pexels
-# into its own category makes that unnecessary -- it just never offers
-# "Latest"), and google/openverse are relevance-only. "anime"'s sort options
-# depend on which site the user picks and live in ANIME_SITE_SORT_OPTIONS
-# below instead, since Safebooru (Gelbooru-style) and Yande.re/Konachan
-# (Moebooru-style) don't share a sort vocabulary.
+# Sort options offered per category. Multi-provider anime categories use
+# each provider's own default ordering rather than forcing one site's sort
+# vocabulary onto the others.
 SORT_OPTIONS = {
     "pixabay": [("🔥 Popular", "popular"), ("🆕 Latest", "latest")],
     "unsplash": [("🔥 Popular", "popular"), ("🆕 Latest", "latest")],
@@ -1408,9 +1399,8 @@ SORT_OPTIONS = {
     "sfx": [("🔥 Popular", "popular"), ("🆕 Newest", "new"), ("🔍 Best match", "relevance")],
 }
 
-# The "anime" category asks which site before asking for a tag, since each
-# has its own tag-autocomplete API (Yande.re/Konachan are safe-rated-forced
-# here regardless of sort -- see _moebooru_search).
+# Kept for the legacy per-provider tag-autocomplete flow; the category
+# buttons now search all five providers together.
 ANIME_SITES = [
     ("🎌 Safebooru", "safebooru"),
     ("🅳 Danbooru (safe)", "danbooru"),
@@ -1592,25 +1582,12 @@ async def handle_wizard_button(update: Update, context: ContextTypes.DEFAULT_TYP
             await cb.edit_message_text(f"🔎 Searching {', '.join(c for c, _ in plan)} for “{query}”…")
 
             async def run_one(cat: str, provider: str):
-                if cat == "anime":
-                    async def run_anime_provider(anime_provider: str):
-                        status_msg = await context.bot.send_message(
-                            chat_id=chat_id, text=f"[{anime_provider}] starting…"
-                        )
-                        sort = "favorites" if anime_provider == "waifuim" else "score"
-                        await run_search_job(
-                            context, chat_id, query, PLAIN_TEXT_COUNT, anime_provider,
-                            {"sort": sort, "size": "any"}, status_msg, label=anime_provider,
-                        )
-                    await asyncio.gather(*[
-                        run_anime_provider(p)
-                        for p in ("safebooru", "danbooru", "yandere", "konachan", "waifuim")
-                    ])
-                    return
-
                 status_msg = await context.bot.send_message(chat_id=chat_id, text=f"[{cat}] starting…")
-                extra = {"size": "6k"} if cat == "puzzle" else {}
-                await run_search_job(context, chat_id, query, PLAIN_TEXT_COUNT, provider, extra, status_msg, label=cat)
+                if cat in ("anime", "puzzle"):
+                    opts = {"size": "6k"} if cat == "puzzle" else {"size": "any"}
+                    await run_anime_group_job(context, chat_id, query, PLAIN_TEXT_COUNT, opts, status_msg, cat, "zip")
+                else:
+                    await run_search_job(context, chat_id, query, PLAIN_TEXT_COUNT, provider, {}, status_msg, label=cat)
 
             await asyncio.gather(*[run_one(cat, provider) for cat, provider in plan])
             PENDING_SEARCHES.pop(search_id, None)
@@ -1623,17 +1600,11 @@ async def handle_wizard_button(update: Update, context: ContextTypes.DEFAULT_TYP
         entry["category"] = value
         entry["provider"] = provider
 
-        if value == "puzzle":
-            # Puzzle images always use the strict 6K+ filter.
+        if value in ("anime", "puzzle"):
+            entry["sort"] = "relevance"
             keyboard = _wiz_kb([[(str(n), f"wz|count|{n}|{search_id}") for n in COUNT_OPTIONS]])
-            await cb.edit_message_text("🧩 Puzzle Images — only images at least 6,000 px on their longest side. How many results?", reply_markup=keyboard)
-            return
-
-        if value == "anime":
-            # One Anime button searches every anime provider in parallel.
-            # Sort vocabularies differ, so each provider gets its own best default.
-            keyboard = _wiz_kb([[(str(n), f"wz|count|{n}|{search_id}") for n in COUNT_OPTIONS]])
-            await cb.edit_message_text("🎌 Anime — search all five sources. How many results per source?", reply_markup=keyboard)
+            prompt = "How many anime results across all five sites?" if value == "anime" else "How many 6K+ anime puzzle images?"
+            await cb.edit_message_text(prompt, reply_markup=keyboard)
             return
 
         if value in SORT_OPTIONS:
@@ -1685,7 +1656,7 @@ async def handle_wizard_button(update: Update, context: ContextTypes.DEFAULT_TYP
     if step == "count":
         entry["count"] = int(value)
         if entry["category"] in ("sfx", "puzzle"):
-            # Audio has no resolution; puzzle category fixes resolution at 6K+.
+            # Audio has no dimensions; puzzle search is fixed to the 6K+ threshold.
             entry["size"] = "6k" if entry["category"] == "puzzle" else "any"
             keyboard = _wiz_kb([[(label, f"wz|deliver|{val}|{search_id}") for label, val in DELIVERY_OPTIONS]])
             await cb.edit_message_text(f"[{entry['category']}] Deliver as:", reply_markup=keyboard)
@@ -1702,39 +1673,56 @@ async def handle_wizard_button(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if step == "deliver":
         category = entry["category"]
+        provider = entry["provider"]
+        label = category
+        extra = {"size": "6k" if category == "puzzle" else entry.get("size", "any")}
         count = entry.get("count", PLAIN_TEXT_COUNT)
-        size = entry.get("size", "any")
 
-        if category == "anime":
-            anime_providers = ["safebooru", "danbooru", "yandere", "konachan", "waifuim"]
-            await cb.edit_message_text(
-                f"🎌 Searching all five anime sources for “{query}” "
-                f"({count} results per source)…"
-            )
-
-            async def run_anime_provider(provider: str):
-                status_msg = await context.bot.send_message(
-                    chat_id=chat_id, text=f"[{provider}] starting…"
-                )
-                sort = "favorites" if provider == "waifuim" else "score"
-                await run_search_job(
-                    context, chat_id, query, count, provider,
-                    {"sort": sort, "size": size}, status_msg,
-                    label=provider, delivery=value,
-                )
-
-            await asyncio.gather(*(run_anime_provider(p) for p in anime_providers))
+        status_msg = await cb.edit_message_text(f"[{label}] 🔎 Searching all five anime sources for “{query}”…")
+        if category in ("anime", "puzzle"):
+            await run_anime_group_job(context, chat_id, query, count, extra, status_msg, category, value)
         else:
-            provider = entry["provider"]
-            extra = {"sort": entry.get("sort"), "size": size}
-            status_msg = await cb.edit_message_text(f"[{category}] 🔎 Searching for “{query}”…")
             await run_search_job(
                 context, chat_id, query, count, provider, extra, status_msg,
-                label=category, delivery=value,
+                label=label, delivery=value,
             )
-
         PENDING_SEARCHES.pop(search_id, None)
         return
+
+
+async def run_anime_group_job(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    query: str,
+    count: int,
+    extra: dict,
+    status_msg,
+    category: str,
+    delivery: str = "zip",
+):
+    """Run the five configured anime sources from one category button.
+
+    Each source gets its own job/status so a timeout or provider failure does
+    not prevent the remaining anime providers from returning their results.
+    """
+    providers = [p for p in ("safebooru", "danbooru", "yandere", "konachan", "waifuim") if p in configured_providers()]
+    if not providers:
+        await status_msg.edit_text("No anime providers are available.")
+        return
+    await status_msg.edit_text(f"[{category}] Searching {len(providers)} anime providers: {', '.join(providers)}…")
+
+    async def run_one(provider: str):
+        child_status = await context.bot.send_message(chat_id=chat_id, text=f"[{provider}] Starting…")
+        provider_extra = dict(extra)
+        # Avoid provider-specific sort parameters when querying all sites together.
+        provider_extra.pop("sort", None)
+        await run_search_job(
+            context, chat_id, query, count, provider, provider_extra,
+            child_status, label=provider, delivery=delivery,
+        )
+
+    await asyncio.gather(*(run_one(provider) for provider in providers), return_exceptions=True)
+    await status_msg.edit_text(f"[{category}] Finished searching {len(providers)} anime providers.")
 
 
 async def run_search_job(

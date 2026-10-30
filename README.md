@@ -1,10 +1,10 @@
 # Telegram Photo Search & Batch-Download Bot
 
-Send the bot a word or phrase and it searches **every configured
-source at once — Google, Pexels, Pixabay, Unsplash, anime art
-(Safebooru/Danbooru/Yande.re/Konachan/Waifu.im), GIFs, SFX, and Openverse** —
-downloading each result set in batch and sending you back a zip per
-category. You can also use `/search` directly for full control over
+Send the bot a word or phrase and it shows category buttons for the
+configured sources. The Anime art and Puzzle Images buttons each search
+all five anime providers (Safebooru, Danbooru, Yande.re, Konachan, and
+Waifu.im) together; Puzzle Images additionally enforces a 6K+ longest-side
+minimum. You can also use `/search` directly for full control over
 provider, count, and file type.
 
 ## Quick start
@@ -21,31 +21,24 @@ In Telegram, just type something like:
 cat wearing sunglasses
 ```
 
-...and the bot replies with an inline button per configured source —
-**Google**, **Pexels**, **Pixabay**, **Unsplash**, **Anime art**,
-**GIF**, **SFX**, **Openverse** — plus **All of the above**.
+...and the bot replies with category buttons — **Google**, **Pexels**,
+**Pixabay**, **Unsplash**, **Anime art (all five sites)**,
+**Anime Puzzle Images (6K+)**, **GIF**, **SFX**, **Openverse** — plus
+**All of the above**.
 
-- Tap **Anime art** to search all five anime sources together — Safebooru,
-  Danbooru, Yande.re, Konachan, and Waifu.im — in parallel. The bot applies
-  each provider's own safe-rated defaults and combines the results under
-  this single button.
-- Tap **Puzzle Images (6K+)** for a separate anime-only search across those
-  same five providers. Only images whose longest side meets the configured
-  minimum dimension are kept (6,000 px by default). Unknown dimensions are
-  excluded so smaller images cannot slip through.
-- Tap **Pixabay**, **Unsplash**, **GIF**, or **SFX** and you get
-  their own sort options (Popular/Latest; Trending/Best match).
-  **Pexels**, **Google**, and **Openverse** have no ordering concept
-  in their APIs and skip straight to the next step.
-- Every category then walks through: **count** (5/10/15/20/30),
-  **minimum resolution** (Any / HD ≥1280px / Full HD ≥1920px —
-  ignored for SFX and fixed to the 6K+ threshold for Puzzle Images),
-  and **delivery** — 📦 one zip file, or 🖼 sent as individual messages
-  (photos inline up to Telegram's 10 MiB photo limit, larger images as
-  documents without recompression, GIFs as animations, SFX as playable
-  audio, anything else as a document).
-- Tap **All of the above** to skip the wizard and run all configured
-  categories with their defaults.
+- Tap **Anime art (all 5 sites)** to search Safebooru, Danbooru (safe),
+  Yande.re, Konachan, and Waifu.im from one button. Each provider runs
+  independently, so a failure at one site does not stop the others.
+- Tap **Anime Puzzle Images (6K+)** for a separate anime-only search across
+  those same five sources. The longest image side must be at least 6,000 px
+  by default; images with unknown dimensions are excluded.
+- Tap **Pixabay**, **Unsplash**, **GIF**, or **SFX** for their provider-specific
+  sort options. Other categories continue with their normal search flow.
+- Every category then walks through count, resolution where applicable, and
+  delivery — a zip or individual messages. Individual photos larger than
+  Telegram's 10 MiB photo limit are sent as documents without recompression.
+- **All of the above** runs each configured category; the Anime and Puzzle
+  categories each fan out to all five anime sources.
 
 Categories with no API key configured simply don't get a button (the
 message tells you which ones were skipped). Safebooru, Yande.re,
@@ -411,17 +404,9 @@ A couple of things specific to Deplexo's container model:
   needs to stay running to receive messages.
 
 
-## Environment variables
+### Anime puzzle-image threshold
 
-Copy `.env.example` to `.env` and fill in the keys for the providers you use.
-Anime booru providers and Openverse do not require API keys.
-
-- `TELEGRAM_BOT_TOKEN` — required Telegram bot token.
-- `PEXELS_API_KEY`, `PIXABAY_API_KEY`, `UNSPLASH_ACCESS_KEY` — stock-photo providers.
-- `GOOGLE_CSE_API_KEY` and `GOOGLE_CSE_ENGINE_ID` — optional Google Custom Search.
-- `SERPAPI_KEY` — optional SerpApi image search.
-- `GIPHY_API_KEY` — optional GIF search.
-- `FREESOUND_API_KEY` — optional Freesound.org sound-effects search.
-- `ANIME_PUZZLE_MIN_DIMENSION` — minimum longest-side dimension for the
-  anime-only Puzzle Images category (default `6000` pixels).
-- `GLOBAL_CONCURRENT_DOWNLOADS` — process-wide download concurrency cap (default `12`).
+The dedicated anime-only Puzzle Images category defaults to a 6,000-pixel
+minimum on the longest side. Set `ANIME_PUZZLE_MIN_DIMENSION` in `.env` to
+change that threshold. Images with missing dimensions are rejected by this
+strict filter.
