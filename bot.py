@@ -1740,13 +1740,18 @@ async def handle_wizard_button(update: Update, context: ContextTypes.DEFAULT_TYP
         extra = {"size": "6k" if category == "puzzle" else entry.get("size", "any")}
         count = entry.get("count", PLAIN_TEXT_COUNT)
 
-        status_msg = await cb.edit_message_text(f"[{label}] 🔎 Searching all five anime sources for “{query}”…")
-        if category in ("anime", "puzzle"):
+        if category == "puzzle":
+            status_msg = await cb.edit_message_text(f"[{label}] 🔎 Searching anime sources for 6K+ puzzle images matching “{query}”…")
             await run_anime_group_job(context, chat_id, query, count, extra, status_msg, category, value)
         else:
+            # Anime category buttons are provider-specific: run ONLY the
+            # selected provider. The extra anime_random button is the sole
+            # option that intentionally searches across multiple providers.
+            site_label = dict(ANIME_SITES).get(provider, provider)
+            status_msg = await cb.edit_message_text(f"[{site_label}] 🔎 Searching {site_label} for “{query}”…")
             await run_search_job(
                 context, chat_id, query, count, provider, extra, status_msg,
-                label=label, delivery=value,
+                label=provider, delivery=value,
             )
         PENDING_SEARCHES.pop(search_id, None)
         return
