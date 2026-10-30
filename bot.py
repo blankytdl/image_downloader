@@ -1430,7 +1430,7 @@ CATEGORY_BUTTON_LABELS = {
     "pexels": "📷 Pexels",
     "pixabay": "🖼 Pixabay",
     "unsplash": "📸 Unsplash",
-    "anime": "🎌 Anime art (all 5 sites)",
+"anime": "🎌 Anime art",
     "puzzle": "🧩 Anime Puzzle Images (6K+)",
     "gif": "🎞 GIF",
     "sfx": "🔊 SFX",
@@ -1599,9 +1599,6 @@ async def handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     search_id = _new_pending(text)
     row = [(CATEGORY_BUTTON_LABELS[cat], f"wz|cat|{cat}|{search_id}") for cat, _ in plan]
     rows = [row[i:i + 2] for i in range(0, len(row), 2)]  # 2 buttons per row
-    if len(plan) > 1:
-        rows.append([("📦 All of the above", f"wz|cat|all|{search_id}")])
-
     msg = f"What would you like for “{text}”?"
     if missing:
         msg += f"\n(not shown: {', '.join(missing)} — no API key configured)"
