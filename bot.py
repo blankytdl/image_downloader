@@ -1430,7 +1430,7 @@ CATEGORY_BUTTON_LABELS = {
     "pexels": "📷 Pexels",
     "pixabay": "🖼 Pixabay",
     "unsplash": "📸 Unsplash",
-"anime": "🎌 Anime art",
+    "anime": "🎌 Anime art",
     "puzzle": "🧩 Anime Puzzle Images (6K+)",
     "gif": "🎞 GIF",
     "sfx": "🔊 SFX",
