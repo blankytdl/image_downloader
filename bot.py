@@ -1929,10 +1929,17 @@ async def run_search_job(
                 paths = paths[:count]
 
             if not paths:
-                msg = f"[{label}] All {failures or len(chosen)} downloads failed."
-                if needs_post_filter:
-                    msg = f"[{label}] None of the results were actually {file_type} files after downloading."
-                await status_msg.edit_text(msg + " Try a different query or provider.")
+                if size in ANIME_HIGH_RES_SIZES and 'rejected' in locals() and rejected:
+                    msg = (
+                        f"[{label}] Downloaded {len(chosen)} candidates, but none had an "
+                        f"actual image dimension of at least {SIZE_THRESHOLDS[size]:,} px "
+                        f"on the longest side ({rejected} rejected). Try another tag or provider."
+                    )
+                else:
+                    msg = f"[{label}] All {failures or len(chosen)} downloads failed."
+                    if needs_post_filter:
+                        msg = f"[{label}] None of the results were actually {file_type} files after downloading."
+                await status_msg.edit_text(msg)
                 return
 
             safe_query = re.sub(r"[^a-zA-Z0-9]+", "_", query)[:30]
