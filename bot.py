@@ -137,21 +137,21 @@ class ImageResult:
     source_page: Optional[str] = None    # page the image was found on, when the provider gives one
 
 
-ANIME_PUZZLE_MIN_DIMENSION = max(1, int(os.getenv("ANIME_PUZZLE_MIN_DIMENSION", "6000")))
-TELEGRAM_PHOTO_SIZE_LIMIT = 10 * 1024 * 1024  # Telegram sendPhoto limit
-SIZE_THRESHOLDS = {"any": 0, "hd": 1280, "fhd": 1920, "6k": ANIME_PUZZLE_MIN_DIMENSION}
+SIZE_THRESHOLDS = {"any": 0, "hd": 1280, "fhd": 1920}
 
 
 def passes_size_filter(img: ImageResult, size: str, require_landscape: bool) -> bool:
     """
-    Normal sizes use a minimum width. The anime-only 6K puzzle filter uses
-    the longest side so portrait and landscape art both qualify. Unknown
-    dimensions are rejected for 6K because the threshold cannot be verified.
+    `size` is one of SIZE_THRESHOLDS's keys and sets a minimum width.
+    `require_landscape` additionally requires width >= height -- used for
+    stock-photo providers (video-editing B-roll), but skipped for booru/GIF
+    sources where portrait art and square/odd-aspect GIFs are normal.
+    Unknown dimensions (0) always pass, since we can't judge them.
     """
     threshold = SIZE_THRESHOLDS.get(size, 0)
     if img.width <= 0 or img.height <= 0:
-        return size != "6k"
-    if threshold and (max(img.width, img.height) if size == "6k" else img.width) < threshold:
+        return True
+    if threshold and img.width < threshold:
         return False
     if require_landscape and img.width < img.height:
         return False
@@ -758,37 +758,70 @@ async def search_tenor(session: aiohttp.ClientSession, query: str, count: int, *
 
 
 async def search_openverse(session: aiohttp.ClientSession, query: str, count: int, **kwargs) -> List[ImageResult]:
+    """Search Openverse for commercially reusable images, with API fallbacks.
+
+    Openverse allows anonymous requests but enforces rate limits and can return
+    transient 429/5xx responses. Keep the page size at its anonymous limit (20),
+    retry transient failures, and fall back to an explicit commercial-use license
+    list if the API rejects the license_type filter. Results link to the original
+    media URL and retain the Openverse landing page for attribution.
     """
-    Openverse (api.openverse.org) -- a free, keyless search over hundreds of
-    millions of Creative Commons / public-domain images pulled from Flickr,
-    Wikimedia Commons, museums and more. license_type=commercial is always
-    forced, so every result permits commercial use (this bot is meant for
-    monetized video); note that CC-BY results still require crediting the
-    creator -- the source page for each image is on Openverse itself.
-    """
-    # Anonymous requests are capped at 20 results per page (larger page_size
-    # gets rejected), so fetch up to 2 pages to have headroom for the
-    # resolution/type filters that run afterwards.
     wanted = max(min(count * 2, 40), 10)
     results: List[ImageResult] = []
-    for page in range(1, (wanted + 19) // 20 + 1):
-        params = {
-            "q": query,
-            "license_type": "commercial",
-            "page_size": 20,
-            "page": page,
-        }
-        wanted_ext = (kwargs.get("file_type") or "").lower().lstrip(".")
-        if wanted_ext:
-            params["extension"] = "jpg" if wanted_ext == "jpeg" else wanted_ext
-        async with session.get("https://api.openverse.org/v1/images/", params=params) as resp:
-            resp.raise_for_status()
-            data = await resp.json()
+    wanted_ext = (kwargs.get("file_type") or "").lower().lstrip(".")
+    if wanted_ext:
+        wanted_ext = "jpg" if wanted_ext == "jpeg" else wanted_ext
 
+    async def fetch_page(page: int) -> dict:
+        base_params = {"q": query, "page_size": 20, "page": page, "filter_dead": "true", "mature": "false"}
+        if wanted_ext:
+            base_params["extension"] = wanted_ext
+        attempts = [
+            {**base_params, "license_type": "commercial"},
+            # Fallback for API deployments that reject license_type for a request.
+            {**base_params, "license": "cc0,by,by-sa,by-nd,pdm"},
+        ]
+        last_error = None
+        for params in attempts:
+            for attempt in range(3):
+                try:
+                    async with session.get(
+                        "https://api.openverse.org/v1/images/",
+                        params=params,
+                        timeout=aiohttp.ClientTimeout(total=20),
+                        headers={"Accept": "application/json"},
+                    ) as resp:
+                        if resp.status == 429 or 500 <= resp.status < 600:
+                            body = (await resp.text())[:250]
+                            last_error = RuntimeError(f"Openverse HTTP {resp.status}: {body}")
+                            if attempt < 2:
+                                await asyncio.sleep(1.0 * (attempt + 1))
+                                continue
+                            break
+                        if resp.status >= 400:
+                            body = (await resp.text())[:400]
+                            last_error = RuntimeError(f"Openverse HTTP {resp.status}: {body}")
+                            break
+                        payload = await resp.json(content_type=None)
+                        if not isinstance(payload, dict):
+                            raise RuntimeError("Openverse returned an unexpected response format")
+                        return payload
+                except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+                    last_error = exc
+                    if attempt < 2:
+                        await asyncio.sleep(1.0 * (attempt + 1))
+                        continue
+                    break
+        raise RuntimeError(f"Openverse search failed: {last_error}")
+
+    for page in range(1, (wanted + 19) // 20 + 1):
+        data = await fetch_page(page)
         page_items = data.get("results", [])
         for item in page_items:
+            if not isinstance(item, dict):
+                continue
             file_url = item.get("url")
-            if not file_url:
+            if not file_url or not isinstance(file_url, str) or not file_url.startswith(("https://", "http://")):
                 continue
             results.append(ImageResult(
                 url=file_url,
@@ -797,7 +830,7 @@ async def search_openverse(session: aiohttp.ClientSession, query: str, count: in
                 source="openverse",
                 ident=str(item.get("id", "")),
                 thumbnail_url=item.get("thumbnail"),
-                source_page=item.get("foreign_landing_url"),
+                source_page=item.get("foreign_landing_url") or item.get("detail_url"),
             ))
         if len(results) >= wanted or len(page_items) < 20:
             break
@@ -1009,10 +1042,8 @@ async def send_single_file(context: ContextTypes.DEFAULT_TYPE, chat_id: int, pat
     with open(path, "rb") as f:
         if ext == "gif":
             await context.bot.send_animation(chat_id=chat_id, animation=f, caption=caption)
-        elif ext in PHOTO_EXTS and os.path.getsize(path) <= TELEGRAM_PHOTO_SIZE_LIMIT:
-            await context.bot.send_photo(chat_id=chat_id, photo=f, caption=caption)
         elif ext in PHOTO_EXTS:
-            await context.bot.send_document(chat_id=chat_id, document=f, caption=caption)
+            await context.bot.send_photo(chat_id=chat_id, photo=f, caption=caption)
         elif ext in AUDIO_EXTS:
             await context.bot.send_audio(chat_id=chat_id, audio=f, caption=caption)
         else:
@@ -1025,10 +1056,9 @@ async def send_single_file(context: ContextTypes.DEFAULT_TYPE, chat_id: int, pat
 
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Just send me a word or phrase and I'll show category buttons — "
-        "Google, stock photos, Anime art (all five sites), Anime Puzzle "
-        "Images (6K+), GIF, SFX, and Openverse. Tap one and I'll "
-        "walk you through count, resolution where applicable, and delivery "
+        "👋 Just send me a word or phrase and I'll show you 4 buttons — "
+        "Google, Stock photos, Safebooru (anime), and GIF. Tap one and I'll "
+        "walk you through sort order, count, resolution, and delivery "
         "(zip or send individually) — or tap \"All of the above\" for a "
         "quick run with defaults.\n\n"
         "For more control, use:\n"
@@ -1204,19 +1234,19 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Type a word or phrase (no command) and I'll show inline buttons for "
         "each configured source — Google, Pexels, Pixabay, Unsplash, Anime "
         "art, GIF, SFX, Openverse.\n"
-        "• *Anime art* searches all five anime sources (Safebooru, Danbooru "
-        "safe, Yande.re, Konachan, and Waifu.im) from one button. Each site "
-        "runs independently, so one provider failing does not stop the others.\n"
-        "• *Anime Puzzle Images (6K+)* is a separate anime-only search across "
-        "those same five sources. The longest side must be at least 6,000 px "
-        "by default; unknown dimensions are rejected.\n"
+        "• Tap *Anime art* and pick a site — Safebooru, Danbooru (safe), "
+        "Yande.re, Konachan, or Waifu.im. Then type part of the character name; I look it up "
+        "against that site's own tag-autocomplete API and show you real "
+        "matching tags to pick from, so you don't have to guess underscore "
+        "formatting yourself. Results are always safe-rated only, even on "
+        "Yande.re/Konachan which otherwise host non-safe content. Sort "
+        "options: 🔥 Top (score), 🆕 New, 🎲 Random.\n"
         "• Tap *Pixabay*, *Unsplash*, *GIF*, or *SFX* for their own sort "
         "options (Popular/Latest, Trending/Best match); *Pexels*, *Google*, "
         "and *Openverse* skip straight to count since those APIs don't "
         "support ordering results.\n"
         "• Every category then asks for count (5-30), minimum resolution "
-        "(Any / HD / Full HD -- ignored for SFX; Puzzle Images is fixed at "
-        "6K+), and delivery — 📦 one zip "
+        "(Any / HD / Full HD -- ignored for SFX), and delivery — 📦 one zip "
         "file, or 🖼 sent as individual messages.\n"
         "• Tap *All of the above* to skip the wizard and get every "
         "configured category at once with default settings.\n\n"
@@ -1233,8 +1263,8 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/providers — list which providers have API keys configured\n\n"
         "*Stock photos* (pexels/pixabay/unsplash): filtered to landscape, "
         f"≥{MIN_WIDTH_FOR_YOUTUBE}px wide by default.\n"
-        "*Anime art / Puzzle Images*: all five anime sources are searched "
-        "together; puzzle mode requires a 6K+ longest side. No key needed.\n"
+        "*Anime art* (safebooru/danbooru/yandere/konachan/waifuim): tag "
+        "search, safe-rated only (forced, not optional), no key needed.\n"
         "  e.g. `/search hatsune_miku 20 yandere type:png minscore:80`\n"
         "*GIFs* (giphy): free API key. Tenor's API was fully shut down by "
         "Google on 2026-06-30 and no longer works.\n"
@@ -1370,28 +1400,32 @@ CATEGORY_PROVIDER_PRIORITY = {
     # picker (see ANIME_SITES below) since all three need no API key and so
     # would otherwise always resolve to the first one, silently.
     "anime": ["safebooru", "danbooru", "yandere", "konachan", "waifuim"],
-    "puzzle": ["safebooru", "danbooru", "yandere", "konachan", "waifuim"],
     "gif": ["giphy"],  # tenor removed: its API is fully decommissioned, see DEPRECATED_PROVIDERS
     "sfx": ["freesound"],
     "openverse": ["openverse"],
 }
-CATEGORY_ORDER = ["google", "pexels", "pixabay", "unsplash", "openverse", "anime", "puzzle", "gif", "sfx"]
+CATEGORY_ORDER = ["google", "pexels", "pixabay", "unsplash", "openverse", "anime", "gif", "sfx"]
 CATEGORY_BUTTON_LABELS = {
     "google": "🔎 Google",
     "pexels": "📷 Pexels",
     "pixabay": "🖼 Pixabay",
     "unsplash": "📸 Unsplash",
-    "anime": "🎌 Anime art (all 5 sites)",
-    "puzzle": "🧩 Anime Puzzle Images (6K+)",
+    "anime": "🎌 Anime art",
     "gif": "🎞 GIF",
     "sfx": "🔊 SFX",
     "openverse": "🌐 Openverse",
 }
 PLAIN_TEXT_COUNT = 10  # default per-category batch size (overridden by the count step)
 
-# Sort options offered per category. Multi-provider anime categories use
-# each provider's own default ordering rather than forcing one site's sort
-# vocabulary onto the others.
+# Sort options offered per category, as (button label, value) pairs. A
+# category with no entry here skips the sort step entirely -- Pexels' API
+# has no ordering parameter at all (previously this bot silently re-routed
+# a "Latest" pick to Pixabay/Unsplash to work around that; splitting Pexels
+# into its own category makes that unnecessary -- it just never offers
+# "Latest"), and google/openverse are relevance-only. "anime"'s sort options
+# depend on which site the user picks and live in ANIME_SITE_SORT_OPTIONS
+# below instead, since Safebooru (Gelbooru-style) and Yande.re/Konachan
+# (Moebooru-style) don't share a sort vocabulary.
 SORT_OPTIONS = {
     "pixabay": [("🔥 Popular", "popular"), ("🆕 Latest", "latest")],
     "unsplash": [("🔥 Popular", "popular"), ("🆕 Latest", "latest")],
@@ -1399,16 +1433,19 @@ SORT_OPTIONS = {
     "sfx": [("🔥 Popular", "popular"), ("🆕 Newest", "new"), ("🔍 Best match", "relevance")],
 }
 
-# Kept for the legacy per-provider tag-autocomplete flow; the category
-# buttons now search all five providers together.
+# The "anime" category asks which site before asking for a tag, since each
+# has its own tag-autocomplete API (Yande.re/Konachan are safe-rated-forced
+# here regardless of sort -- see _moebooru_search).
 ANIME_SITES = [
     ("🎌 Safebooru", "safebooru"),
     ("🅳 Danbooru (safe)", "danbooru"),
     ("🌸 Yande.re", "yandere"),
     ("🎨 Konachan", "konachan"),
     ("💫 Waifu.im", "waifuim"),
+    ("🌐 Get images from all 3", "all3"),
 ]
 ANIME_SITE_AUTOCOMPLETE = {
+    "all3": safebooru_autocomplete,
     "safebooru": safebooru_autocomplete,
     "yandere": yandere_autocomplete,
     "konachan": konachan_autocomplete,
@@ -1583,11 +1620,7 @@ async def handle_wizard_button(update: Update, context: ContextTypes.DEFAULT_TYP
 
             async def run_one(cat: str, provider: str):
                 status_msg = await context.bot.send_message(chat_id=chat_id, text=f"[{cat}] starting…")
-                if cat in ("anime", "puzzle"):
-                    opts = {"size": "6k"} if cat == "puzzle" else {"size": "any"}
-                    await run_anime_group_job(context, chat_id, query, PLAIN_TEXT_COUNT, opts, status_msg, cat, "zip")
-                else:
-                    await run_search_job(context, chat_id, query, PLAIN_TEXT_COUNT, provider, {}, status_msg, label=cat)
+                await run_search_job(context, chat_id, query, PLAIN_TEXT_COUNT, provider, {}, status_msg, label=cat)
 
             await asyncio.gather(*[run_one(cat, provider) for cat, provider in plan])
             PENDING_SEARCHES.pop(search_id, None)
@@ -1600,11 +1633,12 @@ async def handle_wizard_button(update: Update, context: ContextTypes.DEFAULT_TYP
         entry["category"] = value
         entry["provider"] = provider
 
-        if value in ("anime", "puzzle"):
-            entry["sort"] = "relevance"
-            keyboard = _wiz_kb([[(str(n), f"wz|count|{n}|{search_id}") for n in COUNT_OPTIONS]])
-            prompt = "How many anime results across all five sites?" if value == "anime" else "How many 6K+ anime puzzle images?"
-            await cb.edit_message_text(prompt, reply_markup=keyboard)
+        if value == "anime":
+            # Which site? Each has its own tag-autocomplete API and sort
+            # vocabulary (see ANIME_SITE_AUTOCOMPLETE / ANIME_SITE_SORT_OPTIONS).
+            site_btns = [(label, f"wz|animesite|{val}|{search_id}") for label, val in ANIME_SITES]
+            keyboard = _wiz_kb([site_btns[i:i + 2] for i in range(0, len(site_btns), 2)])
+            await cb.edit_message_text("Which anime site?", reply_markup=keyboard)
             return
 
         if value in SORT_OPTIONS:
@@ -1620,14 +1654,17 @@ async def handle_wizard_button(update: Update, context: ContextTypes.DEFAULT_TYP
     if step == "animesite":
         site = value
         entry["provider"] = site
+        # All 3 combines Safebooru, Yande.re, and Konachan. Use Safebooru's
+        # tag suggestions as a starting point; the chosen tag is queried on all three.
         # All three sites use strict/literal booru tag matching (no
         # natural-language fuzzy matching), so look up real tags via that
         # site's own autocomplete API before running anything.
         context.chat_data["awaiting_anime_tag"] = search_id
         site_label = dict(ANIME_SITES).get(site, site)
+        autocomplete_label = "Safebooru" if site == "all3" else site_label
         await cb.edit_message_text(
             f"Type part of the character name or tag — I'll look it up "
-            f"against {site_label}'s own tag list (you searched “{query}”).\n"
+            f"against {autocomplete_label}'s tag list (you searched “{query}”).\n"
             f"Tip: booru tags use Japanese name order, e.g. furudo_erika, not erika_furudo."
         )
         return
@@ -1655,9 +1692,9 @@ async def handle_wizard_button(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if step == "count":
         entry["count"] = int(value)
-        if entry["category"] in ("sfx", "puzzle"):
-            # Audio has no dimensions; puzzle search is fixed to the 6K+ threshold.
-            entry["size"] = "6k" if entry["category"] == "puzzle" else "any"
+        if entry["category"] == "sfx":
+            # audio has no resolution -- skip straight to delivery
+            entry["size"] = "any"
             keyboard = _wiz_kb([[(label, f"wz|deliver|{val}|{search_id}") for label, val in DELIVERY_OPTIONS]])
             await cb.edit_message_text(f"[{entry['category']}] Deliver as:", reply_markup=keyboard)
             return
@@ -1674,55 +1711,17 @@ async def handle_wizard_button(update: Update, context: ContextTypes.DEFAULT_TYP
     if step == "deliver":
         category = entry["category"]
         provider = entry["provider"]
-        label = category
-        extra = {"size": "6k" if category == "puzzle" else entry.get("size", "any")}
+        label = ("Anime art (all 3 sites)" if provider == "all3" else provider) if category == "anime" else category
+        extra = {"sort": entry.get("sort"), "size": entry.get("size", "any")}
         count = entry.get("count", PLAIN_TEXT_COUNT)
 
-        status_msg = await cb.edit_message_text(f"[{label}] 🔎 Searching all five anime sources for “{query}”…")
-        if category in ("anime", "puzzle"):
-            await run_anime_group_job(context, chat_id, query, count, extra, status_msg, category, value)
-        else:
-            await run_search_job(
-                context, chat_id, query, count, provider, extra, status_msg,
-                label=label, delivery=value,
-            )
+        status_msg = await cb.edit_message_text(f"[{label}] 🔎 Searching for “{query}”…")
+        await run_search_job(
+            context, chat_id, query, count, provider, extra, status_msg,
+            label=label, delivery=value,
+        )
         PENDING_SEARCHES.pop(search_id, None)
         return
-
-
-async def run_anime_group_job(
-    context: ContextTypes.DEFAULT_TYPE,
-    chat_id: int,
-    query: str,
-    count: int,
-    extra: dict,
-    status_msg,
-    category: str,
-    delivery: str = "zip",
-):
-    """Run the five configured anime sources from one category button.
-
-    Each source gets its own job/status so a timeout or provider failure does
-    not prevent the remaining anime providers from returning their results.
-    """
-    providers = [p for p in ("safebooru", "danbooru", "yandere", "konachan", "waifuim") if p in configured_providers()]
-    if not providers:
-        await status_msg.edit_text("No anime providers are available.")
-        return
-    await status_msg.edit_text(f"[{category}] Searching {len(providers)} anime providers: {', '.join(providers)}…")
-
-    async def run_one(provider: str):
-        child_status = await context.bot.send_message(chat_id=chat_id, text=f"[{provider}] Starting…")
-        provider_extra = dict(extra)
-        # Avoid provider-specific sort parameters when querying all sites together.
-        provider_extra.pop("sort", None)
-        await run_search_job(
-            context, chat_id, query, count, provider, provider_extra,
-            child_status, label=provider, delivery=delivery,
-        )
-
-    await asyncio.gather(*(run_one(provider) for provider in providers), return_exceptions=True)
-    await status_msg.edit_text(f"[{category}] Finished searching {len(providers)} anime providers.")
 
 
 async def run_search_job(
@@ -1762,15 +1761,46 @@ async def run_search_job(
 
         async def _do_job():
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT), headers=HTTP_HEADERS) as session:
-                search_fn = PROVIDERS[provider]
+                if provider == "all3":
+                    # Search all three core anime sources concurrently. A single
+                    # unavailable source must not prevent results from the others.
+                    providers = ("safebooru", "yandere", "konachan")
+                    batches = await asyncio.gather(
+                        *(PROVIDERS[name](session, query, count, **extra) for name in providers),
+                        return_exceptions=True,
+                    )
+                    valid_batches = []
+                    for name, batch in zip(providers, batches):
+                        if isinstance(batch, Exception):
+                            logger.warning("[anime/all3] %s search failed: %s", name, batch)
+                            continue
+                        valid_batches.append(batch)
+                    # Round-robin sources so the requested batch is not filled
+                    # entirely by the first provider when it has many matches.
+                    raw_results = []
+                    seen_urls = set()
+                    max_batch = max((len(batch) for batch in valid_batches), default=0)
+                    for index in range(max_batch):
+                        for batch in valid_batches:
+                            if index < len(batch):
+                                result = batch[index]
+                                if result.url not in seen_urls:
+                                    seen_urls.add(result.url)
+                                    raw_results.append(result)
+                    logger.info("[anime/all3] %d combined results for %r", len(raw_results), query)
+                else:
+                    search_fn = PROVIDERS[provider]
 
-                # Web search engines (google/serpapi) return arbitrary web-page
+                    # Web search engines (google/serpapi) return arbitrary web-page
                 # URLs that often carry no file extension, so we can't reliably
                 # pre-filter by type from the URL alone -- overfetch candidates
                 # and filter by the real, sniffed type after downloading instead.
                 needs_post_filter = bool(file_type) and provider in WEB_ENGINE_PROVIDERS
-                fetch_n = count * 3 if needs_post_filter else count
-                raw_results = await search_fn(session, query, fetch_n, **extra)
+                if provider != "all3":
+                    fetch_n = count * 3 if needs_post_filter else count
+                    raw_results = await search_fn(session, query, fetch_n, **extra)
+                else:
+                    needs_post_filter = False
                 logger.info("[%s/%s] %d raw results for %r", label, provider, len(raw_results), query)
 
                 if needs_post_filter:
@@ -1778,9 +1808,9 @@ async def run_search_job(
                 else:
                     typed = [r for r in raw_results if matches_file_type(r, file_type)]
 
-                require_landscape = provider not in SKIP_ORIENTATION_FILTER
+                require_landscape = provider not in SKIP_ORIENTATION_FILTER and provider != "all3"
                 filtered = [r for r in typed if passes_size_filter(r, size, require_landscape)]
-                if not filtered and size != "6k":
+                if not filtered:
                     filtered = typed
 
                 chosen = filtered[: (count * 3 if needs_post_filter else count)]

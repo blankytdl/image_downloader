@@ -1,10 +1,10 @@
 # Telegram Photo Search & Batch-Download Bot
 
-Send the bot a word or phrase and it shows category buttons for the
-configured sources. The Anime art and Puzzle Images buttons each search
-all five anime providers (Safebooru, Danbooru, Yande.re, Konachan, and
-Waifu.im) together; Puzzle Images additionally enforces a 6K+ longest-side
-minimum. You can also use `/search` directly for full control over
+Send the bot a word or phrase and it searches **every configured
+source at once — Google, Pexels, Pixabay, Unsplash, anime art
+(Safebooru/Danbooru/Yande.re/Konachan/Waifu.im), GIFs, SFX, and Openverse** —
+downloading each result set in batch and sending you back a zip per
+category. You can also use `/search` directly for full control over
 provider, count, and file type.
 
 ## Quick start
@@ -21,24 +21,38 @@ In Telegram, just type something like:
 cat wearing sunglasses
 ```
 
-...and the bot replies with category buttons — **Google**, **Pexels**,
-**Pixabay**, **Unsplash**, **Anime art (all five sites)**,
-**Anime Puzzle Images (6K+)**, **GIF**, **SFX**, **Openverse** — plus
-**All of the above**.
+...and the bot replies with an inline button per configured source —
+**Google**, **Pexels**, **Pixabay**, **Unsplash**, **Anime art**,
+**GIF**, **SFX**, **Openverse** — plus **All of the above**.
 
-- Tap **Anime art (all 5 sites)** to search Safebooru, Danbooru (safe),
-  Yande.re, Konachan, and Waifu.im from one button. Each provider runs
-  independently, so a failure at one site does not stop the others.
-- Tap **Anime Puzzle Images (6K+)** for a separate anime-only search across
-  those same five sources. The longest image side must be at least 6,000 px
-  by default; images with unknown dimensions are excluded.
-- Tap **Pixabay**, **Unsplash**, **GIF**, or **SFX** for their provider-specific
-  sort options. Other categories continue with their normal search flow.
-- Every category then walks through count, resolution where applicable, and
-  delivery — a zip or individual messages. Individual photos larger than
-  Telegram's 10 MiB photo limit are sent as documents without recompression.
-- **All of the above** runs each configured category; the Anime and Puzzle
-  categories each fan out to all five anime sources.
+- Tap **Anime art** and the bot first asks *which site* — Safebooru,
+  Danbooru (safe), Yande.re, Konachan, or Waifu.im (each has its own tag
+  vocabulary). Then it
+  asks you to type part of the character name or tag, and looks that
+  up against **that site's own tag-autocomplete API** (the same
+  endpoint that backs the search box on the site itself) and shows
+  you real, existing tags to pick from, instead of you having to
+  guess exact underscore formatting yourself. If nothing matches, it
+  falls back to using your text as-is. After picking a tag, you get
+  sort options matching that site's own scoring system: 🔥 **Top
+  (score)**, 🆕 **New**, 🎲 **Random** (Waifu.im offers Most favorited,
+  Newest, and Random). Results are always safe-rated only — Yande.re and Konachan otherwise host non-safe
+  content, so this bot forces a safe-rating filter on every query to
+  those two, with no way to turn it off.
+- Tap **Pixabay**, **Unsplash**, **GIF**, or **SFX** and you get
+  their own sort options (Popular/Latest; Trending/Best match).
+  **Pexels**, **Google**, and **Openverse** have no ordering concept
+  in their APIs and skip straight to the next step.
+- Every category then walks through: **count** (5/10/15/20/30),
+  **minimum resolution** (Any / HD ≥1280px / Full HD ≥1920px —
+  ignored for SFX, which has no dimensions), and **delivery** — 📦
+  one zip file, or 🖼 sent as individual messages (photos inline,
+  GIFs as animations, SFX as playable audio, anything else as a
+  document).
+- Tap **All of the above** to skip the wizard entirely and get every
+  configured category at once with default settings (top/relevance
+  sort, 10 results, any resolution, zipped) — anime art defaults to
+  Safebooru in this mode.
 
 Categories with no API key configured simply don't get a button (the
 message tells you which ones were skipped). Safebooru, Yande.re,
@@ -404,9 +418,4 @@ A couple of things specific to Deplexo's container model:
   needs to stay running to receive messages.
 
 
-### Anime puzzle-image threshold
-
-The dedicated anime-only Puzzle Images category defaults to a 6,000-pixel
-minimum on the longest side. Set `ANIME_PUZZLE_MIN_DIMENSION` in `.env` to
-change that threshold. Images with missing dimensions are rejected by this
-strict filter.
+Anime art: choose an individual source or **Get images from all 3**, which combines Safebooru, Yande.re, and Konachan results for the same tag. If one source is unavailable, results from the other sources can still be used.
