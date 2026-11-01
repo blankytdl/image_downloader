@@ -35,16 +35,19 @@ cat wearing sunglasses
   guess exact underscore formatting yourself. If nothing matches, it
   falls back to using your text as-is. After picking a tag, you get
   sort options matching that site's own scoring system: 🔥 **Top
-  (score)**, 🆕 **New**, 🎲 **Random** (Waifu.im offers Most favorited,
-  Newest, and Random). Results are always safe-rated only — Yande.re and Konachan otherwise host non-safe
-  content, so this bot forces a safe-rating filter on every query to
-  those two, with no way to turn it off.
+  (score)**, 🆕 **New**, 🎲 **Random** (Waifu.im offers Most favorited
+  and Random). Each individual source remains independently selectable.
+  The separate **🎲 Random Anime Sources** button queries all five anime
+  providers and randomly interleaves available results. Results are always
+  safe-rated only — Yande.re and Konachan otherwise host non-safe content,
+  so this bot forces a safe-rating filter on every query to those two.
 - Tap **Pixabay**, **Unsplash**, **GIF**, or **SFX** and you get
   their own sort options (Popular/Latest; Trending/Best match).
   **Pexels**, **Google**, and **Openverse** have no ordering concept
   in their APIs and skip straight to the next step.
 - Every category then walks through: **count** (5/10/15/20/30),
-  **minimum resolution** (Any / HD ≥1280px / Full HD ≥1920px —
+  **minimum resolution** (Any / HD ≥1280px / Full HD ≥1920px; Anime art
+  additionally offers 6K+ ≥6000px and a custom 1–12000px long-edge threshold;
   ignored for SFX, which has no dimensions), and **delivery** — 📦
   one zip file, or 🖼 sent as individual messages (photos inline,
   GIFs as animations, SFX as playable audio, anything else as a
@@ -418,4 +421,4 @@ A couple of things specific to Deplexo's container model:
   needs to stay running to receive messages.
 
 
-Anime art: choose an individual source or **Get images from all 3**, which combines Safebooru, Yande.re, and Konachan results for the same tag. If one source is unavailable, results from the other sources can still be used.
+Anime art: the five individual source buttons (Safebooru, Danbooru, Yande.re, Konachan, and Waifu.im) remain separate. The additional **🎲 Random Anime Sources** button queries all five independently and randomly interleaves the results; an unavailable source is skipped without stopping the others. Anime resolution filters use the image's longest side, with a 6,000px preset and a custom threshold entered directly in the Telegram wizard. These anime-only resolution choices do not affect stock photos, GIFs, SFX, or Openverse.

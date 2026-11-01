@@ -31,6 +31,7 @@ import io
 import logging
 import math
 import os
+import random
 import re
 import shutil
 import tempfile
@@ -137,21 +138,19 @@ class ImageResult:
     source_page: Optional[str] = None    # page the image was found on, when the provider gives one
 
 
-SIZE_THRESHOLDS = {"any": 0, "hd": 1280, "fhd": 1920}
+SIZE_THRESHOLDS = {"any": 0, "hd": 1280, "fhd": 1920, "6k": 6000}
 
 
-def passes_size_filter(img: ImageResult, size: str, require_landscape: bool) -> bool:
-    """
-    `size` is one of SIZE_THRESHOLDS's keys and sets a minimum width.
-    `require_landscape` additionally requires width >= height -- used for
-    stock-photo providers (video-editing B-roll), but skipped for booru/GIF
-    sources where portrait art and square/odd-aspect GIFs are normal.
-    Unknown dimensions (0) always pass, since we can't judge them.
-    """
-    threshold = SIZE_THRESHOLDS.get(size, 0)
+def passes_size_filter(
+    img: ImageResult, size: str, require_landscape: bool, *,
+    anime_resolution: bool = False, custom_min: int = 0,
+) -> bool:
+    """Apply minimum resolution; anime uses the image long edge, others use width."""
+    threshold = custom_min if size == "custom" else SIZE_THRESHOLDS.get(size, 0)
     if img.width <= 0 or img.height <= 0:
         return True
-    if threshold and img.width < threshold:
+    measured = max(img.width, img.height) if anime_resolution else img.width
+    if threshold and measured < threshold:
         return False
     if require_landscape and img.width < img.height:
         return False
@@ -1234,8 +1233,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Type a word or phrase (no command) and I'll show inline buttons for "
         "each configured source — Google, Pexels, Pixabay, Unsplash, Anime "
         "art, GIF, SFX, Openverse.\n"
-        "• Tap *Anime art* and pick a site — Safebooru, Danbooru (safe), "
-        "Yande.re, Konachan, or Waifu.im. Then type part of the character name; I look it up "
+        "• Tap *Anime art* and choose an individual source — Safebooru, Danbooru (safe), "
+        "Yande.re, Konachan, or Waifu.im — or use the separate *🎲 Random Anime Sources* "
+        "button to draw results from multiple anime sources. Then type part of the character name; I look it up "
         "against that site's own tag-autocomplete API and show you real "
         "matching tags to pick from, so you don't have to guess underscore "
         "formatting yourself. Results are always safe-rated only, even on "
@@ -1442,10 +1442,9 @@ ANIME_SITES = [
     ("🌸 Yande.re", "yandere"),
     ("🎨 Konachan", "konachan"),
     ("💫 Waifu.im", "waifuim"),
-    ("🌐 Get images from all 3", "all3"),
 ]
 ANIME_SITE_AUTOCOMPLETE = {
-    "all3": safebooru_autocomplete,
+    "randomanime": safebooru_autocomplete,
     "safebooru": safebooru_autocomplete,
     "yandere": yandere_autocomplete,
     "konachan": konachan_autocomplete,
@@ -1453,6 +1452,7 @@ ANIME_SITE_AUTOCOMPLETE = {
     "waifuim": waifu_im_autocomplete,
 }
 ANIME_SITE_SORT_OPTIONS = {
+    "randomanime": [("🎲 Random", "random")],
     "safebooru": [("🔥 Top (score)", "score"), ("🆕 New", "new"), ("🎲 Random", "random")],
     "yandere": [("🔥 Top (score)", "score"), ("🆕 New", "new"), ("🎲 Random", "random")],
     "konachan": [("🔥 Top (score)", "score"), ("🆕 New", "new"), ("🎲 Random", "random")],
@@ -1462,6 +1462,8 @@ ANIME_SITE_SORT_OPTIONS = {
 
 COUNT_OPTIONS = [5, 10, 15, 20, 30]
 SIZE_OPTIONS = [("Any size", "any"), ("HD (≥1280px)", "hd"), ("Full HD (≥1920px)", "fhd")]
+ANIME_SIZE_OPTIONS = SIZE_OPTIONS + [("🖼 6K+ (≥6000px)", "6k"), ("⚙️ Custom resolution…", "custom")]
+ANIME_PROVIDER_NAMES = ("safebooru", "danbooru", "yandere", "konachan", "waifuim")
 DELIVERY_OPTIONS = [("📦 Zip file", "zip"), ("🖼 Send individually", "individual")]
 
 # Pending searches waiting on the next button tap or text reply:
@@ -1540,6 +1542,26 @@ async def handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         return
 
+    custom_resolution_id = context.chat_data.get("awaiting_custom_anime_resolution")
+    if custom_resolution_id:
+        entry = PENDING_SEARCHES.get(custom_resolution_id)
+        try:
+            pixels = int(re.sub(r"[^0-9]", "", text))
+        except (TypeError, ValueError):
+            pixels = 0
+        if not entry:
+            context.chat_data.pop("awaiting_custom_anime_resolution", None)
+        elif not 1 <= pixels <= 12000:
+            await update.message.reply_text("Please enter a pixel value from 1 to 12000 (for example, 6500).")
+            return
+        else:
+            context.chat_data.pop("awaiting_custom_anime_resolution", None)
+            entry["size"] = "custom"
+            entry["min_resolution"] = pixels
+            keyboard = _wiz_kb([[(label, f"wz|deliver|{val}|{custom_resolution_id}") for label, val in DELIVERY_OPTIONS]])
+            await update.message.reply_text(f"Anime minimum resolution set to {pixels}px. How should I deliver the images?", reply_markup=keyboard)
+            return
+
     awaiting_id = context.chat_data.get("awaiting_anime_tag")
     if awaiting_id:
         context.chat_data.pop("awaiting_anime_tag", None)
@@ -1548,7 +1570,7 @@ async def handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         site = entry.get("provider", "safebooru")
-        site_label = dict(ANIME_SITES).get(site, site)
+        site_label = "🎲 Random Anime Sources" if site == "randomanime" else dict(ANIME_SITES).get(site, site)
         autocomplete_fn = ANIME_SITE_AUTOCOMPLETE.get(site, safebooru_autocomplete)
         sort_options = ANIME_SITE_SORT_OPTIONS.get(site, ANIME_SITE_SORT_OPTIONS["safebooru"])
 
@@ -1637,7 +1659,9 @@ async def handle_wizard_button(update: Update, context: ContextTypes.DEFAULT_TYP
             # Which site? Each has its own tag-autocomplete API and sort
             # vocabulary (see ANIME_SITE_AUTOCOMPLETE / ANIME_SITE_SORT_OPTIONS).
             site_btns = [(label, f"wz|animesite|{val}|{search_id}") for label, val in ANIME_SITES]
-            keyboard = _wiz_kb([site_btns[i:i + 2] for i in range(0, len(site_btns), 2)])
+            keyboard_rows = [site_btns[i:i + 2] for i in range(0, len(site_btns), 2)]
+            keyboard_rows.append([("🎲 Random Anime Sources", f"wz|animesite|randomanime|{search_id}")])
+            keyboard = _wiz_kb(keyboard_rows)
             await cb.edit_message_text("Which anime site?", reply_markup=keyboard)
             return
 
@@ -1661,7 +1685,7 @@ async def handle_wizard_button(update: Update, context: ContextTypes.DEFAULT_TYP
         # site's own autocomplete API before running anything.
         context.chat_data["awaiting_anime_tag"] = search_id
         site_label = dict(ANIME_SITES).get(site, site)
-        autocomplete_label = "Safebooru" if site == "all3" else site_label
+        autocomplete_label = "Safebooru" if site == "randomanime" else site_label
         await cb.edit_message_text(
             f"Type part of the character name or tag — I'll look it up "
             f"against {autocomplete_label}'s tag list (you searched “{query}”).\n"
@@ -1698,11 +1722,16 @@ async def handle_wizard_button(update: Update, context: ContextTypes.DEFAULT_TYP
             keyboard = _wiz_kb([[(label, f"wz|deliver|{val}|{search_id}") for label, val in DELIVERY_OPTIONS]])
             await cb.edit_message_text(f"[{entry['category']}] Deliver as:", reply_markup=keyboard)
             return
-        keyboard = _wiz_kb([[(label, f"wz|size|{val}|{search_id}") for label, val in SIZE_OPTIONS]])
+        size_options = ANIME_SIZE_OPTIONS if entry["category"] == "anime" else SIZE_OPTIONS
+        keyboard = _wiz_kb([[(label, f"wz|size|{val}|{search_id}") for label, val in size_options]])
         await cb.edit_message_text(f"[{entry['category']}] Minimum resolution?", reply_markup=keyboard)
         return
 
     if step == "size":
+        if value == "custom" and entry["category"] == "anime":
+            context.chat_data["awaiting_custom_anime_resolution"] = search_id
+            await cb.edit_message_text("Enter the minimum image long-edge resolution in pixels (for example, 6500). Choose a value from 1 to 12000.")
+            return
         entry["size"] = value
         keyboard = _wiz_kb([[(label, f"wz|deliver|{val}|{search_id}") for label, val in DELIVERY_OPTIONS]])
         await cb.edit_message_text(f"[{entry['category']}] Deliver as:", reply_markup=keyboard)
@@ -1711,8 +1740,8 @@ async def handle_wizard_button(update: Update, context: ContextTypes.DEFAULT_TYP
     if step == "deliver":
         category = entry["category"]
         provider = entry["provider"]
-        label = ("Anime art (all 3 sites)" if provider == "all3" else provider) if category == "anime" else category
-        extra = {"sort": entry.get("sort"), "size": entry.get("size", "any")}
+        label = "Random Anime Sources" if provider == "randomanime" else (provider if category == "anime" else category)
+        extra = {"sort": entry.get("sort"), "size": entry.get("size", "any"), "min_resolution": entry.get("min_resolution", 0)}
         count = entry.get("count", PLAIN_TEXT_COUNT)
 
         status_msg = await cb.edit_message_text(f"[{label}] 🔎 Searching for “{query}”…")
@@ -1761,22 +1790,23 @@ async def run_search_job(
 
         async def _do_job():
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT), headers=HTTP_HEADERS) as session:
-                if provider == "all3":
-                    # Search all three core anime sources concurrently. A single
-                    # unavailable source must not prevent results from the others.
-                    providers = ("safebooru", "yandere", "konachan")
+                if provider == "randomanime":
+                    # Search each anime source independently, then randomly
+                    # interleave results. Individual source buttons remain separate.
+                    providers = list(ANIME_PROVIDER_NAMES)
+                    random.shuffle(providers)
                     batches = await asyncio.gather(
-                        *(PROVIDERS[name](session, query, count, **extra) for name in providers),
+                        *(PROVIDERS[name](session, query, count * 2, **{**extra, "sort": "random"}) for name in providers),
                         return_exceptions=True,
                     )
                     valid_batches = []
                     for name, batch in zip(providers, batches):
                         if isinstance(batch, Exception):
-                            logger.warning("[anime/all3] %s search failed: %s", name, batch)
+                            logger.warning("[anime/random] %s search failed: %s", name, batch)
                             continue
-                        valid_batches.append(batch)
-                    # Round-robin sources so the requested batch is not filled
-                    # entirely by the first provider when it has many matches.
+                        random.shuffle(batch)
+                        if batch:
+                            valid_batches.append(batch)
                     raw_results = []
                     seen_urls = set()
                     max_batch = max((len(batch) for batch in valid_batches), default=0)
@@ -1787,7 +1817,8 @@ async def run_search_job(
                                 if result.url not in seen_urls:
                                     seen_urls.add(result.url)
                                     raw_results.append(result)
-                    logger.info("[anime/all3] %d combined results for %r", len(raw_results), query)
+                    random.shuffle(raw_results)
+                    logger.info("[anime/random] %d results from %d providers for %r", len(raw_results), len(valid_batches), query)
                 else:
                     search_fn = PROVIDERS[provider]
 
@@ -1796,7 +1827,7 @@ async def run_search_job(
                 # pre-filter by type from the URL alone -- overfetch candidates
                 # and filter by the real, sniffed type after downloading instead.
                 needs_post_filter = bool(file_type) and provider in WEB_ENGINE_PROVIDERS
-                if provider != "all3":
+                if provider != "randomanime":
                     fetch_n = count * 3 if needs_post_filter else count
                     raw_results = await search_fn(session, query, fetch_n, **extra)
                 else:
@@ -1808,8 +1839,13 @@ async def run_search_job(
                 else:
                     typed = [r for r in raw_results if matches_file_type(r, file_type)]
 
-                require_landscape = provider not in SKIP_ORIENTATION_FILTER and provider != "all3"
-                filtered = [r for r in typed if passes_size_filter(r, size, require_landscape)]
+                is_anime_job = provider in ANIME_PROVIDER_NAMES or provider == "randomanime"
+                require_landscape = provider not in SKIP_ORIENTATION_FILTER and not is_anime_job
+                filtered = [r for r in typed if passes_size_filter(
+                    r, size, require_landscape,
+                    anime_resolution=is_anime_job,
+                    custom_min=int(extra.get("min_resolution") or 0),
+                )]
                 if not filtered:
                     filtered = typed
 
