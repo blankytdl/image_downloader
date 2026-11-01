@@ -148,7 +148,7 @@ def passes_size_filter(
     """Apply minimum resolution; anime uses the image long edge, others use width."""
     threshold = custom_min if size == "custom" else SIZE_THRESHOLDS.get(size, 0)
     if img.width <= 0 or img.height <= 0:
-        return True
+        return not (anime_resolution and threshold > 0)
     measured = max(img.width, img.height) if anime_resolution else img.width
     if threshold and measured < threshold:
         return False
@@ -1246,7 +1246,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "and *Openverse* skip straight to count since those APIs don't "
         "support ordering results.\n"
         "• Every category then asks for count (5-30), minimum resolution "
-        "(Any / HD / Full HD -- ignored for SFX), and delivery — 📦 one zip "
+        "(Any / HD / Full HD; anime also offers 6K+ and a custom long-edge pixel threshold; ignored for SFX), and delivery — 📦 one zip "
         "file, or 🖼 sent as individual messages.\n"
         "• Tap *All of the above* to skip the wizard and get every "
         "configured category at once with default settings.\n\n"
@@ -1678,13 +1678,13 @@ async def handle_wizard_button(update: Update, context: ContextTypes.DEFAULT_TYP
     if step == "animesite":
         site = value
         entry["provider"] = site
-        # All 3 combines Safebooru, Yande.re, and Konachan. Use Safebooru's
-        # tag suggestions as a starting point; the chosen tag is queried on all three.
-        # All three sites use strict/literal booru tag matching (no
+        # Random Anime Sources uses Safebooru's tag suggestions as a starting
+        # point; the chosen tag is queried independently across all providers.
+        # Individual source buttons remain available. Booru sites use strict tag matching (no
         # natural-language fuzzy matching), so look up real tags via that
         # site's own autocomplete API before running anything.
         context.chat_data["awaiting_anime_tag"] = search_id
-        site_label = dict(ANIME_SITES).get(site, site)
+        site_label = "🎲 Random Anime Sources" if site == "randomanime" else dict(ANIME_SITES).get(site, site)
         autocomplete_label = "Safebooru" if site == "randomanime" else site_label
         await cb.edit_message_text(
             f"Type part of the character name or tag — I'll look it up "
@@ -1846,7 +1846,7 @@ async def run_search_job(
                     anime_resolution=is_anime_job,
                     custom_min=int(extra.get("min_resolution") or 0),
                 )]
-                if not filtered:
+                if not filtered and not (is_anime_job and size != "any"):
                     filtered = typed
 
                 chosen = filtered[: (count * 3 if needs_post_filter else count)]
