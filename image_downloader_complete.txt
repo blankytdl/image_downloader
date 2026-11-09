@@ -1,0 +1,2540 @@
+# IMAGE DOWNLOADER — COMPLETE SOURCE + REQUIREMENTS
+# Source files combined from the repository's current default branch.
+# bot.py is kept unchanged; requirements.txt is appended at the end.
+
+============================== bot.py ==============================
+
+"""
+Telegram Media Search & Batch-Download Bot
+==========================================
+
+Main menu (send any word or phrase):
+
+    1. Stock  -> Pexels, Pixabay, Unsplash, Openverse, Open Media (Wikimedia
+                 Commons), or a random mix of all of them
+    2. GIF    -> Giphy
+    3. Sound  -> Freesound (CC0 / Attribution only)
+    4. Anime  -> Safebooru, Yande.re, Konachan, Danbooru, Gelbooru, or a
+                 random mix of all of them (safe-rated only)
+
+Power users can also use:
+
+    /search <query> [count] [provider] [type:png|jpg|gif] [minscore:N]
+    /overlay arrow red up-right
+    /providers
+    /help
+
+Requirements: see requirements.txt and README.md.
+"""
+
+import asyncio
+import contextlib
+import hashlib
+import logging
+import math
+import os
+import random
+import re
+import shutil
+import tempfile
+import time
+import uuid
+import warnings
+import zipfile
+from dataclasses import dataclass
+from typing import List, Optional
+
+import aiohttp
+from dotenv import load_dotenv
+from PIL import Image, ImageDraw, ImageFile
+from telegram import (
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    InputMediaPhoto, InputMediaDocument, InputMediaAudio,
+)
+from telegram.constants import ParseMode
+from telegram.error import RetryAfter, NetworkError, TimedOut, BadRequest
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+)
+
+load_dotenv()
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger("photo_bot")
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
+PIXABAY_API_KEY = os.getenv("PIXABAY_API_KEY", "")
+UNSPLASH_ACCESS_KEY = os.getenv("UNSPLASH_ACCESS_KEY", "")
+GOOGLE_CSE_API_KEY = os.getenv("GOOGLE_CSE_API_KEY", "")
+GOOGLE_CSE_ENGINE_ID = os.getenv("GOOGLE_CSE_ENGINE_ID", "")
+SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")
+GIPHY_API_KEY = os.getenv("GIPHY_API_KEY", "")
+TENOR_API_KEY = os.getenv("TENOR_API_KEY", "")  # dead, kept so old .env files don't break
+FREESOUND_API_KEY = os.getenv("FREESOUND_API_KEY", "")
+GELBOORU_API_KEY = os.getenv("GELBOORU_API_KEY", "").strip()
+GELBOORU_USER_ID = os.getenv("GELBOORU_USER_ID", "").strip()
+DANBOORU_USER_ID = os.getenv("DANBOORU_USER_ID", "").strip()
+DANBOORU_USERNAME = os.getenv("DANBOORU_USERNAME", "").strip()
+DANBOORU_API_KEY = os.getenv("DANBOORU_API_KEY", "").strip()
+DANBOORU_CONTACT = os.getenv("DANBOORU_CONTACT", "").strip()
+
+
+def _read_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
+    """Read a bounded integer setting without letting a typo crash startup."""
+    raw = os.getenv(name, str(default)).strip()
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s=%r; using default %d", name, raw, default)
+        return default
+    if not minimum <= value <= maximum:
+        logger.warning("%s must be between %d and %d; using default %d", name, minimum, maximum, default)
+        return default
+    return value
+
+
+MAX_ANIME_6K_CANDIDATES = _read_int_env("MAX_ANIME_6K_CANDIDATES", 100, 10, 300)
+TELEGRAM_PHOTO_SIZE_LIMIT = 9 * 1024 * 1024  # margin below Telegram's 10 MiB photo cap
+
+# BUG FIX (6K+ images): Pillow refuses to even open images above ~179 million
+# pixels (DecompressionBombError), which made big wallpapers/art look "broken"
+# and get silently dropped. Raise the ceiling for our own, size-capped
+# downloads (MAX_DOWNLOAD_BYTES) and silence the softer warning.
+Image.MAX_IMAGE_PIXELS = 700_000_000
+ImageFile.MAXBLOCK = 64 * 1024 * 1024  # large JPEG/PNG encodes fail with the default buffer
+ImageFile.LOAD_TRUNCATED_IMAGES = False
+warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+
+DEFAULT_PROVIDER = os.getenv("DEFAULT_PROVIDER", "pexels").lower()
+DEFAULT_COUNT = 10
+WEB_ENGINE_DEFAULT_COUNT = 15
+MAX_COUNT = 30
+MIN_WIDTH_FOR_YOUTUBE = 1280
+CONCURRENT_DOWNLOADS = 6
+GLOBAL_CONCURRENT_DOWNLOADS = _read_int_env("GLOBAL_CONCURRENT_DOWNLOADS", 12, 1, 64)
+GLOBAL_DOWNLOAD_SEMAPHORE = asyncio.Semaphore(GLOBAL_CONCURRENT_DOWNLOADS)
+DOWNLOAD_CHUNK_BYTES = 64 * 1024
+MAX_DOWNLOAD_BYTES = 150 * 1024 * 1024
+TELEGRAM_DOC_SIZE_LIMIT = 45 * 1024 * 1024  # keep under the 50MB bot API cap
+DOWNLOAD_TIMEOUT = 180  # 6K+ originals can be tens of MB
+
+HTTP_HEADERS = {"User-Agent": "AnimeImageDownloader/2.1 (+https://github.com/)"}
+# Yande.re / Konachan answer HTTP 403 to non-browser User-Agents (this was the
+# "konachan: 403 Forbidden" error), so those two get a browser-like identity.
+BROWSER_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    ),
+    "Accept": "application/json,text/javascript,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+DANBOORU_REQUEST_INTERVAL = _read_int_env("DANBOORU_REQUEST_INTERVAL", 2, 1, 120)
+_DANBOORU_REQUEST_LOCK = asyncio.Lock()
+_DANBOORU_LAST_REQUEST = 0.0
+
+WEB_ENGINE_PROVIDERS = {"google", "serpapi"}
+
+CONTENT_TYPE_TO_EXT = {
+    "image/jpeg": "jpg", "image/jpg": "jpg", "image/png": "png",
+    "image/gif": "gif", "image/webp": "webp", "image/bmp": "bmp",
+    "image/tiff": "tiff", "image/svg+xml": "svg", "image/x-icon": "ico",
+    "audio/mpeg": "mp3", "audio/mp3": "mp3", "audio/wav": "wav",
+    "audio/x-wav": "wav", "audio/ogg": "ogg", "audio/flac": "flac",
+}
+AUDIO_EXTS = {"mp3", "wav", "ogg", "flac", "m4a"}
+IMAGE_EXTS = {"jpg", "png", "gif", "webp", "bmp", "tiff", "svg", "ico"}
+MEDIA_EXTS = AUDIO_EXTS | IMAGE_EXTS
+
+WORKDIR = os.path.join(tempfile.gettempdir(), "photo_bot_jobs")
+os.makedirs(WORKDIR, exist_ok=True)
+
+
+@dataclass
+class ImageResult:
+    url: str
+    width: int
+    height: int
+    source: str
+    ident: str
+    score: Optional[int] = None
+    thumbnail_url: Optional[str] = None
+    source_page: Optional[str] = None
+
+
+class ProviderResults(list):
+    """List of ImageResult items plus provider names that failed in a mixed search."""
+    def __init__(self, values=(), provider_errors=None):
+        super().__init__(values)
+        self.provider_errors = list(provider_errors or [])
+
+
+SIZE_THRESHOLDS = {"any": 0, "hd": 1280, "fhd": 1920}
+
+
+def passes_size_filter(img: ImageResult, size: str, require_landscape: bool) -> bool:
+    """Minimum-width filter (+ optional landscape). Unknown dimensions (0) pass."""
+    threshold = SIZE_THRESHOLDS.get(size, 0)
+    if img.width <= 0 or img.height <= 0:
+        return True
+    if threshold and img.width < threshold:
+        return False
+    if require_landscape and img.width < img.height:
+        return False
+    return True
+
+
+def url_extension(url: str) -> str:
+    lower = url.lower().split("?")[0]
+    for ext in (".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".tiff", ".svg",
+                ".mp3", ".wav", ".ogg", ".flac", ".m4a"):
+        if lower.endswith(ext):
+            return ext.lstrip(".")
+    return ""
+
+
+def ext_from_content_type(content_type: str) -> str:
+    if not content_type:
+        return ""
+    return CONTENT_TYPE_TO_EXT.get(content_type.split(";")[0].strip().lower(), "")
+
+
+def matches_file_type(ext_or_img, file_type: Optional[str]) -> bool:
+    if not file_type:
+        return True
+    wanted = file_type.lower().lstrip(".")
+    wanted_set = {"jpg", "jpeg"} if wanted in ("jpg", "jpeg") else {wanted}
+    ext = ext_or_img if isinstance(ext_or_img, str) else url_extension(ext_or_img.url)
+    return ext.lower() in wanted_set
+
+
+def _safe_int(value, default: int = 0) -> int:
+    try:
+        return int(value) if value is not None else default
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def short_error(exc: BaseException) -> str:
+    """Compact, URL-free error text (the old messages leaked full API URLs + tags)."""
+    if isinstance(exc, aiohttp.ClientResponseError):
+        return f"HTTP {exc.status}"
+    if isinstance(exc, asyncio.TimeoutError):
+        return "timeout"
+    if isinstance(exc, aiohttp.ClientError):
+        return type(exc).__name__
+    return str(exc)[:120] or type(exc).__name__
+
+
+def _split_tags(query: str) -> List[str]:
+    raw = [t.strip() for t in re.split(r"[,\n]", query) if t.strip()]
+    return [t.replace(" ", "_") for t in raw]
+
+
+def _dimension_variants(min_dimension: int, template: str = "{axis}:>={n}") -> List[List[str]]:
+    """
+    Server-side "longest side >= N" filter. Booru sites can only filter on
+    width OR height, so two queries are issued (one per axis) and merged.
+    Returns [[]] (a single unfiltered query) when no threshold is set.
+    """
+    if min_dimension and min_dimension >= 1000:
+        return [[template.format(axis="width", n=min_dimension)],
+                [template.format(axis="height", n=min_dimension)]]
+    return [[]]
+
+
+# ---------------------------------------------------------------------------
+# Stock providers
+# ---------------------------------------------------------------------------
+
+async def search_pexels(session: aiohttp.ClientSession, query: str, count: int, **kwargs) -> List[ImageResult]:
+    if not PEXELS_API_KEY:
+        raise RuntimeError("PEXELS_API_KEY is not set.")
+    headers = {"Authorization": PEXELS_API_KEY}
+    params = {"query": query, "per_page": min(max(count * 2, 10), 80), "orientation": "landscape"}
+    async with session.get("https://api.pexels.com/v1/search", headers=headers, params=params) as resp:
+        resp.raise_for_status()
+        data = await resp.json()
+    results = []
+    for photo in data.get("photos", []):
+        src = photo.get("src") or {}
+        url = src.get("original") or src.get("large2x")
+        if not url:
+            continue
+        results.append(ImageResult(
+            url=url, width=_safe_int(photo.get("width")), height=_safe_int(photo.get("height")),
+            source="pexels", ident=str(photo.get("id")),
+        ))
+    return results
+
+
+async def search_pixabay(session: aiohttp.ClientSession, query: str, count: int, **kwargs) -> List[ImageResult]:
+    if not PIXABAY_API_KEY:
+        raise RuntimeError("PIXABAY_API_KEY is not set.")
+    order_map = {"popular": "popular", "latest": "latest"}
+    params = {
+        "key": PIXABAY_API_KEY,
+        "q": query,
+        "image_type": "photo",
+        "orientation": "horizontal",
+        "per_page": max(min(count * 2, 200), 3),
+        "safesearch": "true",
+        "order": order_map.get(kwargs.get("sort"), "popular"),
+    }
+    async with session.get("https://pixabay.com/api/", params=params) as resp:
+        resp.raise_for_status()
+        data = await resp.json()
+    results = []
+    for hit in data.get("hits", []):
+        # fullHDURL / imageURL only exist for accounts with full API access.
+        full = hit.get("fullHDURL") or hit.get("imageURL")
+        url = full or hit.get("largeImageURL") or hit.get("webformatURL")
+        if not url:
+            continue
+        w, h = _safe_int(hit.get("imageWidth")), _safe_int(hit.get("imageHeight"))
+        if not full and w and h and max(w, h) > 1280:
+            # BUG FIX: largeImageURL is capped at 1280px, but the API reports the
+            # original size -- so the "Full HD" filter was passing 1280px files.
+            scale = 1280 / max(w, h)
+            w, h = int(w * scale), int(h * scale)
+        results.append(ImageResult(url=url, width=w, height=h, source="pixabay", ident=str(hit.get("id"))))
+    return results
+
+
+async def search_unsplash(session: aiohttp.ClientSession, query: str, count: int, **kwargs) -> List[ImageResult]:
+    if not UNSPLASH_ACCESS_KEY:
+        raise RuntimeError("UNSPLASH_ACCESS_KEY is not set.")
+    headers = {"Authorization": f"Client-ID {UNSPLASH_ACCESS_KEY}"}
+    order_map = {"popular": "relevant", "latest": "latest"}
+    params = {
+        "query": query,
+        "per_page": min(max(count * 2, 10), 30),
+        "orientation": "landscape",
+        "order_by": order_map.get(kwargs.get("sort"), "relevant"),
+    }
+    async with session.get("https://api.unsplash.com/search/photos", headers=headers, params=params) as resp:
+        resp.raise_for_status()
+        data = await resp.json()
+    results = []
+    for photo in data.get("results", []):
+        url = (photo.get("urls") or {}).get("full")
+        if not url:
+            continue
+        results.append(ImageResult(
+            url=url, width=_safe_int(photo.get("width")), height=_safe_int(photo.get("height")),
+            source="unsplash", ident=str(photo.get("id")),
+        ))
+    return results
+
+
+async def search_openverse(session: aiohttp.ClientSession, query: str, count: int, **kwargs) -> List[ImageResult]:
+    """Openverse -- keyless CC / public-domain search, commercial licenses forced."""
+    wanted = max(min(count * 3, 60), 20)
+    wanted_ext = (kwargs.get("file_type") or "").lower().lstrip(".")
+    results: List[ImageResult] = []
+    for page in range(1, (wanted + 19) // 20 + 1):
+        params = {"q": query, "license_type": "commercial", "page_size": 20, "page": page}
+        if wanted_ext:
+            params["extension"] = "jpg" if wanted_ext == "jpeg" else wanted_ext
+        async with session.get("https://api.openverse.org/v1/images/", params=params) as resp:
+            if resp.status == 404 and page > 1:  # ran past the last page
+                break
+            resp.raise_for_status()
+            data = await resp.json()
+        page_items = data.get("results", [])
+        for item in page_items:
+            file_url = item.get("url")
+            if not file_url:
+                continue
+            results.append(ImageResult(
+                url=file_url, width=_safe_int(item.get("width")), height=_safe_int(item.get("height")),
+                source="openverse", ident=str(item.get("id", "")),
+                thumbnail_url=item.get("thumbnail"), source_page=item.get("foreign_landing_url"),
+            ))
+        if len(page_items) < 20:
+            break
+    return results
+
+
+async def search_openmedia(session: aiohttp.ClientSession, query: str, count: int, **kwargs) -> List[ImageResult]:
+    """
+    "Open Media" = Wikimedia Commons, the free media repository behind
+    Wikipedia (keyless). Only JPEG/PNG/WebP files up to 40 MB are returned;
+    everything on Commons is freely licensed, but CC-BY / CC-BY-SA files still
+    require attribution -- check each file's Commons page before publishing.
+    """
+    params = {
+        "action": "query", "format": "json", "formatversion": "2",
+        "generator": "search", "gsrnamespace": "6",
+        "gsrsearch": f"{query} filetype:bitmap",
+        "gsrlimit": str(min(max(count * 3, 20), 50)),
+        "prop": "imageinfo", "iiprop": "url|size|mime",
+    }
+    async with session.get("https://commons.wikimedia.org/w/api.php", params=params) as resp:
+        resp.raise_for_status()
+        data = await resp.json(content_type=None)
+    pages = (data.get("query") or {}).get("pages") or []
+    pages = sorted((p for p in pages if isinstance(p, dict)), key=lambda p: p.get("index", 0))
+    results = []
+    for page in pages:
+        infos = page.get("imageinfo") or []
+        if not infos:
+            continue
+        info = infos[0]
+        if info.get("mime") not in ("image/jpeg", "image/png", "image/webp"):
+            continue
+        if _safe_int(info.get("size")) > 40 * 1024 * 1024:
+            continue
+        url = info.get("url")
+        if not url:
+            continue
+        results.append(ImageResult(
+            url=url, width=_safe_int(info.get("width")), height=_safe_int(info.get("height")),
+            source="openmedia", ident=str(page.get("pageid", "")),
+            source_page=info.get("descriptionurl"),
+        ))
+    return results
+
+
+# "Random from all" for stock. Only providers that are configured take part;
+# failures of individual sources are reported but never abort the mix.
+STOCK_PROVIDER_NAMES = ("pexels", "pixabay", "unsplash", "openverse", "openmedia")
+
+
+async def _mix_providers(names, session, query: str, count: int, label: str, **kwargs) -> ProviderResults:
+    """
+    Query several providers concurrently, dedupe, and interleave them
+    round-robin (each source shuffled first) so every source is represented
+    instead of the biggest one drowning out the rest.
+    """
+    blocked = [n for n in names if provider_ready(n)[0] and in_cooldown(n)]
+    names = [n for n in names if provider_ready(n)[0] and not in_cooldown(n)]
+    if not names:
+        raise RuntimeError(f"No {label} source is available right now (missing keys or temporarily blocked).")
+    batches = await asyncio.gather(
+        *[PROVIDERS[n](session, query, max(count, 1), **kwargs) for n in names],
+        return_exceptions=True,
+    )
+    per_source, seen, errors = [], set(), []
+    for name, batch in zip(names, batches):
+        if isinstance(batch, BaseException):
+            logger.warning("%s source %s failed: %s", label, name, batch)
+            errors.append(f"{name}: {short_error(batch)}")
+            mark_failed(name, batch)
+            continue
+        items = []
+        for item in batch:
+            if item.url and item.url not in seen:
+                seen.add(item.url)
+                items.append(item)
+        random.shuffle(items)
+        per_source.append(items)
+    errors += [f"{n}: temporarily skipped (blocked a moment ago)" for n in blocked]
+    merged = []
+    for i in range(max((len(x) for x in per_source), default=0)):
+        for items in per_source:
+            if i < len(items):
+                merged.append(items[i])
+    if not merged and errors:
+        raise RuntimeError(f"All {label} sources failed: " + " | ".join(errors))
+    return ProviderResults(merged, errors)
+
+
+async def search_stock_mix(session, query, count, **kwargs):
+    return await _mix_providers(STOCK_PROVIDER_NAMES, session, query, count, "stock", **kwargs)
+
+
+# Temporary cool-down for sources that are blocking us (HTTP 403 etc.), so a
+# dead source does not slow down or pollute every Anime/Stock mix.
+_SOURCE_COOLDOWN: dict = {}
+SOURCE_COOLDOWN_SECONDS = 300
+
+
+def in_cooldown(name: str) -> bool:
+    return _SOURCE_COOLDOWN.get(name, 0) > time.monotonic()
+
+
+def mark_failed(name: str, exc: BaseException):
+    blocked = (
+        isinstance(exc, aiohttp.ClientResponseError) and exc.status in (401, 403, 429)
+    ) or (isinstance(exc, RuntimeError) and re.search(r"HTTP (401|403|429)", str(exc)))
+    if blocked:
+        _SOURCE_COOLDOWN[name] = time.monotonic() + SOURCE_COOLDOWN_SECONDS
+
+
+# ---------------------------------------------------------------------------
+# Anime providers (all forced to the safe/general rating, re-checked client-side)
+# ---------------------------------------------------------------------------
+
+BOORU_SORT_GELBOORU = {                 # Safebooru.org + Gelbooru (Gelbooru 0.2-style)
+    "score": "sort:score:desc",
+    "new": "sort:id:desc",
+    "random": "sort:random",
+}
+MOEBOORU_SORT_TAGS = {                  # Yande.re + Konachan (Moebooru)
+    "score": "order:score",
+    "new": "order:date",
+    "random": "order:random",
+}
+SAFE_RATINGS = {"s", "safe", "g", "general"}
+
+
+def _dedupe_by_url(items: List[ImageResult]) -> List[ImageResult]:
+    seen, out = set(), []
+    for it in items:
+        if it.url not in seen:
+            seen.add(it.url)
+            out.append(it)
+    return out
+
+
+def _finish_booru(results: List[ImageResult], sort_choice: str) -> List[ImageResult]:
+    results = _dedupe_by_url(results)
+    if sort_choice == "random":
+        random.shuffle(results)
+    elif sort_choice == "score":
+        results.sort(key=lambda r: r.score or 0, reverse=True)
+    return results
+
+
+# ---- Safebooru.org and Gelbooru (same API family) -------------------------
+
+async def _gelbooru_style_fetch(session, url: str, tag_string: str, limit: int, auth: dict):
+    params = {"page": "dapi", "s": "post", "q": "index", "json": "1",
+              "limit": limit, "tags": tag_string, **auth}
+    async with session.get(url, params=params, headers=BROWSER_HEADERS) as resp:
+        resp.raise_for_status()
+        try:
+            data = await resp.json(content_type=None)
+        except Exception:
+            return []          # empty body == "no results" on these sites
+    if isinstance(data, dict):  # Gelbooru wraps posts: {"@attributes": {...}, "post": [...]}
+        if data.get("success") is False or "message" in data and "post" not in data:
+            raise RuntimeError(f"HTTP 403: {str(data.get('message') or data)[:100]}")
+        data = data.get("post") or []
+    return data if isinstance(data, list) else []
+
+
+def _parse_gelbooru_style(data, source: str, image_base: str, min_score: int) -> List[ImageResult]:
+    results = []
+    for post in data:
+        if not isinstance(post, dict) or str(post.get("rating", "")).lower() not in SAFE_RATINGS:
+            continue  # explicit safe rating only
+        score = _safe_int(post.get("score"))
+        if score < min_score:
+            continue
+        file_url = post.get("file_url")
+        if not file_url and post.get("directory") and post.get("image"):
+            file_url = f"{image_base}/{post['directory']}/{post['image']}"
+        if not file_url:
+            continue
+        if file_url.startswith("//"):
+            file_url = "https:" + file_url
+        results.append(ImageResult(
+            url=file_url, width=_safe_int(post.get("width")), height=_safe_int(post.get("height")),
+            source=source, ident=str(post.get("id")), score=score,
+        ))
+    return results
+
+
+async def _gelbooru_style_search(session, *, url, source, image_base, safe_tag, auth,
+                                 query, count, **kwargs) -> List[ImageResult]:
+    min_score = _safe_int(kwargs.get("minscore"))
+    sort_choice = kwargs.get("sort", "score")
+    min_dimension = _safe_int(kwargs.get("min_dimension"))
+    limit = max(min(count * 3, 100), 10)
+    base = _split_tags(query) + [safe_tag]
+    sort_tag = BOORU_SORT_GELBOORU.get(sort_choice, BOORU_SORT_GELBOORU["score"])
+
+    async def run(extra: List[str]):
+        try:
+            data = await _gelbooru_style_fetch(session, url, " ".join(base + extra + [sort_tag]), limit, auth)
+            if not data:  # a sort:/dimension meta-tag can trip the query up -> retry without sort
+                data = await _gelbooru_style_fetch(session, url, " ".join(base + extra), limit, auth)
+            return data
+        except Exception:
+            if extra:   # dimension meta-tag unsupported/blocked: let the caller fall back
+                return []
+            raise
+
+    batches = await asyncio.gather(*[run(v) for v in _dimension_variants(min_dimension)],
+                                   return_exceptions=True)
+    ok = [b for b in batches if not isinstance(b, BaseException)]
+    if not ok:
+        raise batches[0]
+    data = [p for b in ok for p in b]
+    if not data and min_dimension:   # server-side size filter gave nothing -> plain query; filtered after download
+        data = await run([])
+    return _finish_booru(_parse_gelbooru_style(data, source, image_base, min_score), sort_choice)
+
+
+async def search_safebooru(session, query: str, count: int, **kwargs) -> List[ImageResult]:
+    """Safebooru.org -- safe-only, no key."""
+    return await _gelbooru_style_search(
+        session, url="https://safebooru.org/index.php", source="safebooru",
+        image_base="https://safebooru.org/images", safe_tag="rating:safe", auth={},
+        query=query, count=count, **kwargs)
+
+
+def _gelbooru_ready() -> bool:
+    return bool(GELBOORU_API_KEY and GELBOORU_USER_ID)
+
+
+async def search_gelbooru(session, query: str, count: int, **kwargs) -> List[ImageResult]:
+    """Gelbooru.com -- 'general' rating only. Gelbooru requires an API key + user id."""
+    if not _gelbooru_ready():
+        raise RuntimeError(
+            "Gelbooru needs GELBOORU_API_KEY and GELBOORU_USER_ID (free: gelbooru.com -> "
+            "Settings -> Options -> API Access Credentials)."
+        )
+    return await _gelbooru_style_search(
+        session, url="https://gelbooru.com/index.php", source="gelbooru",
+        image_base="https://img3.gelbooru.com/images", safe_tag="rating:general",
+        auth={"api_key": GELBOORU_API_KEY, "user_id": GELBOORU_USER_ID},
+        query=query, count=count, **kwargs)
+
+
+def _clean_autocomplete(data, limit: int) -> List[str]:
+    tags: List[str] = []
+    for item in data or []:
+        if isinstance(item, str):
+            tag = item
+        elif isinstance(item, dict):
+            tag = item.get("value") or item.get("label") or item.get("name") or ""
+            tag = re.sub(r"\s*\(\d+\)\s*$", "", tag).strip()
+        else:
+            continue
+        if tag and tag not in tags:
+            tags.append(tag)
+    return tags[:limit]
+
+
+async def _autocomplete_get(url: str, params: dict, headers: Optional[dict] = None):
+    try:
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers or HTTP_HEADERS) as session:
+            async with session.get(url, params=params) as resp:
+                resp.raise_for_status()
+                try:
+                    return await resp.json(content_type=None)
+                except Exception:
+                    return []
+    except Exception:
+        logger.warning("Autocomplete request failed (%s)", url, exc_info=True)
+        return []
+
+
+async def safebooru_autocomplete(partial: str, limit: int = 8) -> List[str]:
+    return _clean_autocomplete(
+        await _autocomplete_get("https://safebooru.org/autocomplete.php", {"q": partial}, BROWSER_HEADERS), limit)
+
+
+async def gelbooru_autocomplete(partial: str, limit: int = 8) -> List[str]:
+    if not _gelbooru_ready():
+        return []
+    data = await _autocomplete_get(
+        "https://gelbooru.com/index.php",
+        {"page": "autocomplete2", "term": partial, "type": "tag_query", "limit": limit,
+         "api_key": GELBOORU_API_KEY, "user_id": GELBOORU_USER_ID}, BROWSER_HEADERS)
+    return _clean_autocomplete(data, limit)
+
+
+# ---- Yande.re and Konachan (Moebooru) -------------------------------------
+
+MOEBOORU_HOSTS = {
+    "yandere": ["https://yande.re"],
+    # konachan.net is the "safe" domain; konachan.com is the full site. Try both.
+    "konachan": ["https://konachan.net", "https://konachan.com"],
+}
+
+
+async def _moebooru_fetch(session, source: str, tag_string: str, limit: int) -> list:
+    """Try each known host; a 403 / Cloudflare HTML page on one falls through to the next."""
+    last_exc: Optional[BaseException] = None
+    for host in MOEBOORU_HOSTS[source]:
+        for attempt in range(2):
+            try:
+                headers = {**BROWSER_HEADERS, "Referer": f"{host}/post"}
+                async with session.get(f"{host}/post.json", params={"tags": tag_string, "limit": limit},
+                                       headers=headers) as resp:
+                    if resp.status == 429 and attempt == 0:
+                        await asyncio.sleep(2)
+                        continue
+                    resp.raise_for_status()
+                    data = await resp.json(content_type=None)
+                return data if isinstance(data, list) else []
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+                last_exc = exc
+                break   # next host
+    raise last_exc or RuntimeError(f"{source}: no host answered")
+
+
+async def _moebooru_search(source: str, session, query: str, count: int, **kwargs) -> List[ImageResult]:
+    min_score = _safe_int(kwargs.get("minscore"))
+    sort_choice = kwargs.get("sort", "score")
+    min_dimension = _safe_int(kwargs.get("min_dimension"))
+    limit = max(min(count * 3, 100), 10)
+    base = _split_tags(query) + ["rating:safe",   # forced, not user-overridable
+                                 MOEBOORU_SORT_TAGS.get(sort_choice, MOEBOORU_SORT_TAGS["score"])]
+
+    async def run(extra: List[str]):
+        try:
+            return await _moebooru_fetch(session, source, " ".join(base + extra), limit)
+        except Exception:
+            if extra:
+                return []
+            raise
+
+    batches = await asyncio.gather(*[run(v) for v in _dimension_variants(min_dimension)],
+                                   return_exceptions=True)
+    ok = [b for b in batches if not isinstance(b, BaseException)]
+    if not ok:
+        raise batches[0]
+    data = [p for b in ok for p in b]
+    if not data and min_dimension:
+        data = await run([])
+
+    results = []
+    for post in data:
+        if not isinstance(post, dict) or post.get("rating") != "s":
+            continue
+        score = _safe_int(post.get("score"))
+        file_url = post.get("file_url")
+        if score < min_score or not file_url:
+            continue
+        if file_url.startswith("//"):
+            file_url = "https:" + file_url
+        results.append(ImageResult(
+            url=file_url, width=_safe_int(post.get("width")), height=_safe_int(post.get("height")),
+            source=source, ident=str(post.get("id")), score=score,
+        ))
+    return _finish_booru(results, sort_choice)
+
+
+async def search_yandere(session, query: str, count: int, **kwargs) -> List[ImageResult]:
+    return await _moebooru_search("yandere", session, query, count, **kwargs)
+
+
+async def search_konachan(session, query: str, count: int, **kwargs) -> List[ImageResult]:
+    return await _moebooru_search("konachan", session, query, count, **kwargs)
+
+
+async def _moebooru_autocomplete(source: str, partial: str, limit: int = 8) -> List[str]:
+    for host in MOEBOORU_HOSTS[source]:
+        data = await _autocomplete_get(
+            f"{host}/tag.json", {"name_pattern": f"*{partial}*", "limit": limit, "order": "count"},
+            BROWSER_HEADERS)
+        names = _clean_autocomplete(data, limit)
+        if names:
+            return names
+    return []
+
+
+async def yandere_autocomplete(partial: str, limit: int = 8) -> List[str]:
+    return await _moebooru_autocomplete("yandere", partial, limit)
+
+
+async def konachan_autocomplete(partial: str, limit: int = 8) -> List[str]:
+    return await _moebooru_autocomplete("konachan", partial, limit)
+
+
+# ---- Danbooru (safe) ------------------------------------------------------
+
+def _danbooru_headers() -> dict:
+    agent = (f"AnimeImageDownloader/2.1 (user #{DANBOORU_USER_ID})" if DANBOORU_USER_ID
+             else "AnimeImageDownloader/2.1")
+    if DANBOORU_CONTACT:
+        agent += f"; contact: {DANBOORU_CONTACT}"
+    return {"User-Agent": agent, "Accept": "application/json"}
+
+
+def _danbooru_auth():
+    if DANBOORU_USERNAME and DANBOORU_API_KEY:
+        return aiohttp.BasicAuth(DANBOORU_USERNAME, DANBOORU_API_KEY)
+    return None
+
+
+async def _danbooru_rate_limit():
+    global _DANBOORU_LAST_REQUEST
+    async with _DANBOORU_REQUEST_LOCK:
+        delay = DANBOORU_REQUEST_INTERVAL - (time.monotonic() - _DANBOORU_LAST_REQUEST)
+        if delay > 0:
+            await asyncio.sleep(delay)
+        _DANBOORU_LAST_REQUEST = time.monotonic()
+
+
+async def _danbooru_get_json(session, path: str, params: dict):
+    """Safe-mode Danbooru first, then the main host with rating:g still forced."""
+    headers, auth = _danbooru_headers(), _danbooru_auth()
+    hosts = ("https://safebooru.donmai.us", "https://danbooru.donmai.us")
+    for host_index, host in enumerate(hosts):
+        for attempt in range(2):
+            await _danbooru_rate_limit()
+            async with session.get(f"{host}{path}", params=params, headers=headers, auth=auth) as resp:
+                if (resp.status == 429 or resp.status >= 500) and attempt == 0:
+                    try:
+                        pause = min(max(float(resp.headers.get("Retry-After", "2")), 2.0), 30.0)
+                    except ValueError:
+                        pause = 2.0
+                    await asyncio.sleep(pause)
+                    continue
+                if resp.status in (403, 404) and host_index == 0:
+                    break  # try the main host
+                if resp.status == 403:
+                    raise RuntimeError(
+                        "HTTP 403 from Danbooru (set DANBOORU_USER_ID, and DANBOORU_USERNAME + "
+                        "DANBOORU_API_KEY if it keeps blocking)")
+                if resp.status == 429:
+                    raise RuntimeError("HTTP 429 from Danbooru (rate-limited)")
+                resp.raise_for_status()
+                try:
+                    return await resp.json(content_type=None)
+                except Exception as exc:
+                    raise RuntimeError("Danbooru returned invalid JSON") from exc
+    raise RuntimeError("Danbooru search failed on both hostnames")
+
+
+async def search_danbooru_safe(session, query: str, count: int, **kwargs) -> List[ImageResult]:
+    min_score = _safe_int(kwargs.get("minscore"))
+    sort_choice = kwargs.get("sort", "score")
+    min_dimension = _safe_int(kwargs.get("min_dimension"))
+    tags_in = _split_tags(query)
+    user_tag = tags_in[0] if tags_in else ""     # anonymous accounts: 1 ordinary tag + metatags
+    limit = max(min(count * 3, 100), 10)
+
+    async def run(extra: List[str]):
+        tags = [t for t in (user_tag, "rating:g") if t] + extra
+        if sort_choice == "score":
+            tags.append("order:score")
+        params = {"tags": " ".join(tags), "limit": limit}
+        if sort_choice == "random":
+            params["random"] = "true"
+        try:
+            data = await _danbooru_get_json(session, "/posts.json", params)
+        except Exception:
+            if extra:
+                return []
+            raise
+        return data if isinstance(data, list) else []
+
+    batches = await asyncio.gather(
+        *[run(v) for v in _dimension_variants(min_dimension)], return_exceptions=True)
+    ok = [b for b in batches if not isinstance(b, BaseException)]
+    if not ok:
+        raise batches[0]
+    data = [p for b in ok for p in b]
+    if not data and min_dimension:
+        data = await run([])
+
+    results = []
+    for post in data:
+        if not isinstance(post, dict) or post.get("rating") != "g":
+            continue
+        score = _safe_int(post.get("score"))
+        file_url = post.get("file_url") or post.get("large_file_url")
+        if score < min_score or not file_url:
+            continue
+        results.append(ImageResult(
+            url=file_url, width=_safe_int(post.get("image_width")), height=_safe_int(post.get("image_height")),
+            source="danbooru",
+            ident=str(post.get("id") or hashlib.sha1(file_url.encode()).hexdigest()[:12]),
+            score=score, thumbnail_url=post.get("preview_file_url"),
+        ))
+    return _finish_booru(results, sort_choice)
+
+
+async def danbooru_safe_autocomplete(partial: str, limit: int = 8) -> List[str]:
+    try:
+        timeout = aiohttp.ClientTimeout(total=15)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            data = await _danbooru_get_json(session, "/tags.json", {
+                "search[name_matches]": f"*{partial}*", "search[order]": "count", "limit": limit,
+            })
+    except Exception:
+        logger.warning("Danbooru autocomplete failed for %r", partial, exc_info=True)
+        return []
+    return [i["name"] for i in data or []
+            if isinstance(i, dict) and i.get("name") and _safe_int(i.get("post_count")) > 0][:limit]
+
+
+# ---- Anime: random mix of everything --------------------------------------
+
+# Waifu.im was removed on purpose (its hosted API shut down). Gelbooru takes part
+# in the mix only when its API credentials are configured.
+ANIME_PROVIDER_NAMES = ("safebooru", "yandere", "konachan", "danbooru", "gelbooru")
+
+
+async def search_anime_mix(session, query: str, count: int, **kwargs) -> List[ImageResult]:
+    kwargs = {**kwargs, "sort": "random"}
+    return await _mix_providers(ANIME_PROVIDER_NAMES, session, query, count, "anime", **kwargs)
+
+async def search_google_cse(session: aiohttp.ClientSession, query: str, count: int, **kwargs) -> List[ImageResult]:
+    """
+    Optional. Requires GOOGLE_CSE_API_KEY + GOOGLE_CSE_ENGINE_ID (a Programmable
+    Search Engine configured for image search). Free tier is capped at 100
+    queries/day and results are NOT guaranteed to be reusable -- you are
+    responsible for checking the license of anything downloaded this way
+    before using it in a published video.
+    """
+    if not GOOGLE_CSE_API_KEY or not GOOGLE_CSE_ENGINE_ID:
+        raise RuntimeError("GOOGLE_CSE_API_KEY / GOOGLE_CSE_ENGINE_ID not set.")
+    results = []
+    # Google CSE returns max 10 per page, up to 100 total (start=1..91)
+    for start in range(1, min(count, 50) + 1, 10):
+        params = {
+            "key": GOOGLE_CSE_API_KEY,
+            "cx": GOOGLE_CSE_ENGINE_ID,
+            "q": query,
+            "searchType": "image",
+            "imgSize": "large",
+            "safe": "active",
+            "num": 10,
+            "start": start,
+        }
+        async with session.get("https://www.googleapis.com/customsearch/v1", params=params) as resp:
+            if resp.status != 200:
+                detail = (await resp.text())[:300]
+                raise RuntimeError(
+                    f"Google Custom Search returned HTTP {resp.status}: {detail or 'no response body'}. "
+                    "Check the API key, search engine ID, quota, and API availability."
+                )
+            data = await resp.json()
+        for i, item in enumerate(data.get("items", [])):
+            img_meta = item.get("image", {})
+            if not item.get("link"):
+                continue
+            results.append(ImageResult(
+                url=item.get("link"),
+                width=_safe_int(img_meta.get("width")),
+                height=_safe_int(img_meta.get("height")),
+                source="google",
+                ident=f"{start}_{i}",
+                thumbnail_url=img_meta.get("thumbnailLink"),
+                source_page=img_meta.get("contextLink"),
+            ))
+        if len(results) >= count:
+            break
+    return results
+
+
+async def search_serpapi(session: aiohttp.ClientSession, query: str, count: int, **kwargs) -> List[ImageResult]:
+    """
+    Real Google Images results via SerpApi (https://serpapi.com/) -- a paid
+    pass-through API (no free tier beyond a small trial), used when Google
+    CSE's curated/limited index isn't turning up what you need. Requires
+    SERPAPI_KEY.
+    """
+    if not SERPAPI_KEY:
+        raise RuntimeError("SERPAPI_KEY is not set.")
+    params = {
+        "engine": "google_images",
+        "q": query,
+        "api_key": SERPAPI_KEY,
+        "ijn": "0",
+    }
+    async with session.get("https://serpapi.com/search", params=params) as resp:
+        resp.raise_for_status()
+        data = await resp.json()
+    results = []
+    for i, item in enumerate(data.get("images_results", [])[: max(count * 2, count)]):
+        url = item.get("original") or item.get("thumbnail")
+        if not url:
+            continue
+        results.append(ImageResult(
+            url=url,
+            width=_safe_int(item.get("original_width")),
+            height=_safe_int(item.get("original_height")),
+            source="serpapi",
+            ident=str(item.get("position", i)),
+        ))
+    return results
+
+
+async def search_giphy(session: aiohttp.ClientSession, query: str, count: int, **kwargs) -> List[ImageResult]:
+    """GIF search via Giphy (free API key: https://developers.giphy.com/), best-match order."""
+    if not GIPHY_API_KEY:
+        raise RuntimeError("GIPHY_API_KEY is not set.")
+    limit = min(max(count, 1), 50)
+    params = {"api_key": GIPHY_API_KEY, "q": query, "limit": limit, "rating": "pg-13"}
+    if kwargs.get("sort") == "trending":   # only reachable via code/legacy callers; query is ignored by Giphy here
+        url = "https://api.giphy.com/v1/gifs/trending"
+        params.pop("q")
+    else:
+        url = "https://api.giphy.com/v1/gifs/search"
+    async with session.get(url, params=params) as resp:
+        resp.raise_for_status()
+        data = await resp.json()
+    results = []
+    for item in data.get("data", []):
+        images = item.get("images", {}) or {}
+        chosen = None
+        # Prefer the full-size original, but fall back to smaller renditions when the
+        # original is too big for Telegram (50 MB bot upload cap).
+        for name in ("original", "downsized_large", "downsized", "fixed_height"):
+            img = images.get(name) or {}
+            if img.get("url") and _safe_int(img.get("size")) <= 40 * 1024 * 1024:
+                chosen = img
+                break
+        if not chosen:
+            continue
+        results.append(ImageResult(
+            url=chosen["url"], width=_safe_int(chosen.get("width")), height=_safe_int(chosen.get("height")),
+            source="giphy", ident=str(item.get("id", "")),
+        ))
+    return results
+
+
+async def search_tenor(session: aiohttp.ClientSession, query: str, count: int, **kwargs) -> List[ImageResult]:
+    """
+    DEAD: Google fully decommissioned the Tenor API on 2026-06-30 -- every
+    integration, including this one, stopped working that day. There is no
+    successor endpoint; Google's own guidance is to migrate to GIPHY (or a
+    third party like Klipy). Kept here (raising immediately, before any
+    network call) so /search tenor and old TENOR_API_KEY configs fail with
+    an accurate explanation instead of a confusing network error.
+    """
+    raise RuntimeError(DEPRECATED_PROVIDERS["tenor"])
+
+
+# Excludes Noncommercial/ShareAlike-only licenses -- this bot is meant for
+# monetized video use, and the free-provider picks throughout this file are
+# all chosen for licenses that permit that. Still check the specific sound's
+# page for attribution wording before publishing; CC-BY requires credit.
+FREESOUND_LICENSE_FILTER = 'license:("Creative Commons 0" OR "Attribution")'
+FREESOUND_SORT_MAP = {"popular": "downloads_desc", "new": "created_desc", "relevance": "score"}
+
+
+async def search_freesound(session: aiohttp.ClientSession, query: str, count: int, **kwargs) -> List[ImageResult]:
+    """
+    Freesound.org sound-effects search. Needs a free FREESOUND_API_KEY --
+    simple API-key auth is enough for text search + downloading the
+    "preview" encode (good-quality MP3); Freesound's original uncompressed
+    file requires a full OAuth2 flow, which this bot doesn't implement, so
+    the preview is what gets downloaded/sent.
+    """
+    if not FREESOUND_API_KEY:
+        raise RuntimeError("FREESOUND_API_KEY is not set.")
+    sort = FREESOUND_SORT_MAP.get(kwargs.get("sort"), "score")
+    params = {
+        "query": query,
+        "token": FREESOUND_API_KEY,
+        "page_size": min(max(count, 1), 150),
+        "sort": sort,
+        "filter": FREESOUND_LICENSE_FILTER,
+        "fields": "id,name,previews,duration,license,url",
+    }
+    async with session.get("https://freesound.org/apiv2/search/", params=params) as resp:
+        resp.raise_for_status()
+        data = await resp.json()
+
+    results = []
+    for item in data.get("results", []):
+        if not isinstance(item, dict):
+            continue
+        previews = item.get("previews", {}) or {}
+        file_url = previews.get("preview-hq-mp3") or previews.get("preview-lq-mp3")
+        if not file_url:
+            continue
+        # Belt-and-suspenders on top of the server-side license filter: never
+        # pass along anything that looks Noncommercial / Sampling+.
+        lic = (item.get("license") or "").lower()
+        if "-nc" in lic or "noncommercial" in lic or "sampling" in lic:
+            continue
+        # width/height are meaningless for audio -- ImageResult's size/
+        # orientation filters already treat 0 as "always passes".
+        results.append(ImageResult(
+            url=file_url,
+            width=0,
+            height=0,
+            source="freesound",
+            ident=str(item.get("id", "")),
+        ))
+    return results
+
+
+
+
+PROVIDERS = {
+    # stock
+    "pexels": search_pexels,
+    "pixabay": search_pixabay,
+    "unsplash": search_unsplash,
+    "openverse": search_openverse,
+    "openmedia": search_openmedia,
+    "stockmix": search_stock_mix,
+    # anime
+    "safebooru": search_safebooru,
+    "yandere": search_yandere,
+    "konachan": search_konachan,
+    "danbooru": search_danbooru_safe,
+    "gelbooru": search_gelbooru,
+    "animemix": search_anime_mix,
+    # gif / sound
+    "giphy": search_giphy,
+    "freesound": search_freesound,
+    # extras reachable through /search only
+    "google": search_google_cse,
+    "serpapi": search_serpapi,
+    "tenor": search_tenor,
+}
+
+# Still selectable so /search can explain *why* it no longer works.
+DEPRECATED_PROVIDERS = {
+    "tenor": (
+        "Tenor's GIF API was fully shut down by Google on 2026-06-30 and no "
+        "longer works for anyone, key or no key. Use giphy instead."
+    ),
+}
+
+ANIME_CATEGORY_IDS = set(ANIME_PROVIDER_NAMES) | {"animemix"}
+
+# Anime/GIF/audio art is often portrait or odd-aspect -- skip the landscape filter.
+SKIP_ORIENTATION_FILTER = ANIME_CATEGORY_IDS | {"giphy", "tenor", "freesound"}
+
+# Sources that serve media only to browser-like clients / with a Referer.
+BOORU_SOURCES = {"safebooru", "yandere", "konachan", "gelbooru"}
+
+
+def provider_ready(name: str):
+    """Returns (usable, hint). hint names the setting that is missing."""
+    if name in DEPRECATED_PROVIDERS:
+        return False, "retired"
+    needs = {
+        "pexels": (PEXELS_API_KEY, "PEXELS_API_KEY"),
+        "pixabay": (PIXABAY_API_KEY, "PIXABAY_API_KEY"),
+        "unsplash": (UNSPLASH_ACCESS_KEY, "UNSPLASH_ACCESS_KEY"),
+        "giphy": (GIPHY_API_KEY, "GIPHY_API_KEY"),
+        "freesound": (FREESOUND_API_KEY, "FREESOUND_API_KEY"),
+        "gelbooru": (_gelbooru_ready(), "GELBOORU_API_KEY and GELBOORU_USER_ID"),
+        "google": (GOOGLE_CSE_API_KEY and GOOGLE_CSE_ENGINE_ID, "GOOGLE_CSE_API_KEY and GOOGLE_CSE_ENGINE_ID"),
+        "serpapi": (SERPAPI_KEY, "SERPAPI_KEY"),
+    }
+    if name in needs:
+        ok, hint = needs[name]
+        return bool(ok), hint
+    return True, ""
+
+
+def configured_providers() -> List[str]:
+    return [name for name in PROVIDERS if provider_ready(name)[0]]
+
+
+# ---------------------------------------------------------------------------
+# Download + validate + zip
+# ---------------------------------------------------------------------------
+
+def detected_file_extension(path: str) -> str:
+    """Detect the real file type from its bytes (never trust URL suffixes)."""
+    try:
+        with Image.open(path) as image_file:
+            fmt = (image_file.format or "").upper()
+            mapping = {"JPEG": "jpg", "PNG": "png", "GIF": "gif", "WEBP": "webp",
+                       "BMP": "bmp", "TIFF": "tiff", "ICO": "ico"}
+            if fmt in mapping:
+                return mapping[fmt]
+    except Exception:
+        pass
+    try:
+        with open(path, "rb") as f:
+            head = f.read(64)
+        if head.startswith(b"\xff\xd8\xff"):
+            return "jpg"
+        if head.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "png"
+        if head.startswith((b"GIF87a", b"GIF89a")):
+            return "gif"
+        if head[:4] == b"RIFF" and head[8:12] == b"WEBP":
+            return "webp"
+        if head.startswith(b"BM"):
+            return "bmp"
+        if head.startswith((b"II*\x00", b"MM\x00*")):
+            return "tiff"
+        if head.startswith(b"fLaC"):
+            return "flac"
+        if head.startswith(b"OggS"):
+            return "ogg"
+        if head.startswith(b"RIFF") and head[8:12] == b"WAVE":
+            return "wav"
+        if head.startswith(b"ID3") or (len(head) > 1 and head[0] == 0xFF and (head[1] & 0xE0) == 0xE0):
+            return "mp3"
+        if len(head) >= 12 and head[4:8] == b"ftyp":
+            return "m4a"
+        stripped = head.lstrip()
+        if stripped.startswith(b"<svg") or (stripped.startswith(b"<?xml") and b"<svg" in stripped):
+            return "svg"
+    except OSError:
+        pass
+    return ""
+
+
+def _image_dimensions(path: str):
+    """Real on-disk image dimensions, or None for unreadable / non-image files."""
+    try:
+        with Image.open(path) as image_file:
+            width, height = image_file.size
+        if width > 0 and height > 0:
+            return width, height
+    except Exception:
+        logger.debug("Could not inspect image dimensions: %s", path, exc_info=True)
+    return None
+
+
+def dedupe_image_results(results: List[ImageResult]) -> List[ImageResult]:
+    seen, unique = set(), []
+    for item in results or []:
+        url = (item.url or "").strip()
+        if url and url not in seen:
+            seen.add(url)
+            unique.append(item)
+    return unique
+
+
+PROVIDER_REFERRERS = {
+    "safebooru": "https://safebooru.org/",
+    "gelbooru": "https://gelbooru.com/",
+    "danbooru": "https://danbooru.donmai.us/",
+    "yandere": "https://yande.re/",
+    "konachan": "https://konachan.net/",
+    "giphy": "https://giphy.com/",
+    "openverse": "https://openverse.org/",
+}
+
+
+async def download_one(session: aiohttp.ClientSession, img: ImageResult, dest_dir: str,
+                       sem: asyncio.Semaphore) -> Optional[str]:
+    """Stream one media result to disk with bounded retries and unique names."""
+    async with sem, GLOBAL_DOWNLOAD_SEMAPHORE:
+        source = re.sub(r"[^A-Za-z0-9_-]+", "_", img.source or "image")[:24] or "image"
+        ident = re.sub(r"[^A-Za-z0-9_-]+", "_", str(img.ident or "item"))[:40] or "item"
+        url_hash = hashlib.sha1(img.url.encode("utf-8", "ignore")).hexdigest()[:10]
+        request_headers = {"Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"}
+        if img.source in BOORU_SOURCES:
+            request_headers["User-Agent"] = BROWSER_HEADERS["User-Agent"]
+        if img.source_page:
+            request_headers["Referer"] = img.source_page
+        elif img.source in PROVIDER_REFERRERS:
+            request_headers["Referer"] = PROVIDER_REFERRERS[img.source]
+
+        last_error = None
+        for attempt in range(3):
+            tmp_path = None
+            try:
+                timeout = aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT, sock_read=60)
+                async with session.get(img.url, timeout=timeout, headers=request_headers) as resp:
+                    if resp.status == 429 or 500 <= resp.status < 600:
+                        raw_retry = resp.headers.get("Retry-After", "")
+                        try:
+                            wait = min(max(float(raw_retry), 1.0), 20.0) if raw_retry else min(2 ** attempt, 8)
+                        except ValueError:
+                            wait = min(2 ** attempt, 8)
+                        if attempt < 2:
+                            logger.warning("Temporary HTTP %s downloading %s; retrying in %.1fs", resp.status, img.url, wait)
+                            await asyncio.sleep(wait)
+                            continue
+                    resp.raise_for_status()
+                    content_type = resp.headers.get("Content-Type", "").split(";", 1)[0].strip().lower()
+                    if content_type in {"text/html", "application/json", "text/plain", "application/xml", "text/xml"}:
+                        logger.warning("Skipping non-media response for %s (Content-Type: %s)", img.url, content_type)
+                        return None
+                    raw_length = resp.headers.get("Content-Length")
+                    if raw_length:
+                        try:
+                            if int(raw_length) > MAX_DOWNLOAD_BYTES:
+                                logger.warning("Skipping %s: Content-Length exceeds %d bytes", img.url, MAX_DOWNLOAD_BYTES)
+                                return None
+                        except ValueError:
+                            pass
+
+                    content_type_ext = ext_from_content_type(content_type)
+                    guessed_ext = url_extension(img.url) or content_type_ext or "bin"
+                    path = os.path.join(dest_dir, f"{source}_{ident}_{url_hash}.{guessed_ext}")
+                    tmp_path = path + ".part"
+                    total = 0
+                    with open(tmp_path, "wb") as f:
+                        async for chunk in resp.content.iter_chunked(DOWNLOAD_CHUNK_BYTES):
+                            total += len(chunk)
+                            if total > MAX_DOWNLOAD_BYTES:
+                                raise ValueError(f"exceeded {MAX_DOWNLOAD_BYTES // (1024 * 1024)}MB safety cap")
+                            f.write(chunk)
+
+                actual_ext = detected_file_extension(tmp_path) or content_type_ext or url_extension(img.url) or "bin"
+                if actual_ext != guessed_ext:
+                    path = os.path.join(dest_dir, f"{source}_{ident}_{url_hash}.{actual_ext}")
+                os.replace(tmp_path, path)
+                return path
+            except aiohttp.ClientResponseError as exc:
+                last_error = exc
+                if exc.status not in (408, 425, 429) and not 500 <= exc.status < 600:
+                    logger.warning("HTTP %s downloading %s; not retrying", exc.status, img.url)
+                    return None
+                if attempt < 2:
+                    await asyncio.sleep(min(2 ** attempt, 8))
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                last_error = exc
+                if attempt < 2:
+                    await asyncio.sleep(min(2 ** attempt, 8))
+            except Exception as exc:
+                logger.warning("Failed to download %s: %s", img.url, exc)
+                return None
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+        logger.warning("Download failed after retries for %s: %s", img.url, last_error)
+        return None
+
+
+def _shrink_to_fit(path: str, limit: int) -> Optional[str]:
+    """
+    Telegram bots cannot upload files above 50 MB, and 6K+ PNGs often exceed
+    that. Re-encode such an image as a high-quality JPEG at the SAME pixel size.
+    Returns the new path, or None if it cannot be made to fit.
+    """
+    try:
+        with Image.open(path) as im:
+            im.load()
+            if im.mode in ("RGBA", "LA", "P"):
+                im = im.convert("RGBA")
+                bg = Image.new("RGB", im.size, (255, 255, 255))
+                bg.paste(im, mask=im.split()[-1])
+                im = bg
+            elif im.mode != "RGB":
+                im = im.convert("RGB")
+            out = os.path.splitext(path)[0] + "_fit.jpg"
+            for quality in (95, 90, 85, 78, 70):
+                im.save(out, "JPEG", quality=quality, subsampling=0 if quality >= 90 else 2)
+                if os.path.getsize(out) <= limit:
+                    os.remove(path)
+                    return out
+            os.remove(out)
+    except Exception:
+        logger.warning("Could not shrink %s to fit Telegram's limit", path, exc_info=True)
+    return None
+
+
+def validate_and_fit(path: str, wanted_exts: Optional[set], min_dimension: int):
+    """
+    Blocking (Pillow) -- call via a thread. Returns (final_path, was_shrunk) or None.
+
+    BUG FIX: previously anything that downloaded without error was delivered,
+    including HTML/JSON error pages served as application/octet-stream and
+    truncated files -- those arrived as a bogus ".bin"/"json" document. Now every
+    file must be a recognisable image/audio file, readable, of the requested
+    type, and (for 6K+ searches) really that large.
+    """
+    def drop():
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return None
+
+    ext = detected_file_extension(path)
+    if ext not in MEDIA_EXTS:
+        logger.warning("Discarding %s: not a recognised image/audio file", path)
+        return drop()
+    if wanted_exts and ext not in wanted_exts:
+        return drop()
+    if ext in IMAGE_EXTS - {"svg"}:
+        dims = _image_dimensions(path)
+        if not dims:
+            logger.warning("Discarding %s: unreadable/corrupt image", path)
+            return drop()
+        if min_dimension and max(dims) < min_dimension:
+            return drop()
+    elif min_dimension:
+        return drop()
+
+    limit = TELEGRAM_DOC_SIZE_LIMIT - 512 * 1024
+    if os.path.getsize(path) > limit:
+        if ext in IMAGE_EXTS - {"svg", "gif"}:
+            fitted = _shrink_to_fit(path, limit)
+            if fitted:
+                return fitted, True
+        return drop()
+    return path, False
+
+
+async def collect_media(session, candidates: List[ImageResult], job_dir: str, need: int,
+                        file_type: Optional[str], min_dimension: int, progress=None):
+    """
+    Download candidates in small waves until `need` VALID files are collected
+    (or candidates run out). BUG FIX: the old code downloaded exactly `count`
+    candidates, so every dead link / 403 / wrong-type file permanently shrank the
+    result (hence "sent 1/1 files").
+    Returns (paths, failed_count, shrunk_count).
+    """
+    wanted_exts = None
+    if file_type:
+        w = file_type.lower().lstrip(".")
+        wanted_exts = {"jpg", "jpeg"} if w in ("jpg", "jpeg") else {w}
+    sem = asyncio.Semaphore(CONCURRENT_DOWNLOADS)
+    paths: List[str] = []
+    failed = shrunk = idx = 0
+    while idx < len(candidates) and len(paths) < need:
+        wave = max(1, min(need - len(paths) + 2, CONCURRENT_DOWNLOADS * 2))
+        batch = candidates[idx: idx + wave]
+        idx += len(batch)
+        got = await asyncio.gather(*[download_one(session, img, job_dir, sem) for img in batch],
+                                   return_exceptions=True)
+        for item in got:
+            if not isinstance(item, str):
+                failed += 1
+                continue
+            checked = await asyncio.to_thread(validate_and_fit, item, wanted_exts, min_dimension)
+            if checked is None:
+                failed += 1
+                continue
+            paths.append(checked[0])
+            shrunk += 1 if checked[1] else 0
+        if progress:
+            await progress(min(len(paths), need), need, idx, len(candidates))
+    return paths[:need], failed, shrunk
+
+
+def zip_files(paths: List[str], zip_path: str) -> str:
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for p in paths:
+            zf.write(p, arcname=os.path.basename(p))
+    return zip_path
+
+
+def chunk_by_size(paths: List[str], limit_bytes: int) -> List[List[str]]:
+    batches, current, current_size = [], [], 0
+    for p in paths:
+        size = os.path.getsize(p)
+        if current and current_size + size > limit_bytes:
+            batches.append(current)
+            current, current_size = [], 0
+        current.append(p)
+        current_size += size
+    if current:
+        batches.append(current)
+    return batches
+
+
+PHOTO_EXTS = {"jpg", "jpeg", "png", "webp"}
+# Telegram's default upload timeout (~20 s) is far too short for 40 MB zips / 6K images.
+UPLOAD_TIMEOUTS = {"read_timeout": 300, "write_timeout": 300, "connect_timeout": 30, "pool_timeout": 30}
+
+
+async def _send_with_telegram_retry(send_callable, max_attempts: int = 5):
+    """Retry Telegram uploads after flood waits and transient network failures."""
+    last_error = None
+    for attempt in range(max_attempts):
+        try:
+            return await send_callable()
+        except RetryAfter as exc:
+            last_error = exc
+            raw_wait = getattr(exc, "retry_after", 1)
+            if hasattr(raw_wait, "total_seconds"):
+                raw_wait = raw_wait.total_seconds()
+            try:
+                wait_seconds = max(1.0, float(raw_wait))
+            except (TypeError, ValueError):
+                wait_seconds = 1.0
+            if attempt >= max_attempts - 1:
+                raise
+            logger.warning("Telegram flood control: retrying in %.1f s (attempt %d/%d)",
+                           wait_seconds, attempt + 2, max_attempts)
+            await asyncio.sleep(wait_seconds + 0.5)
+        except (NetworkError, TimedOut) as exc:
+            last_error = exc
+            if attempt >= max_attempts - 1:
+                raise
+            wait_seconds = min(2 ** attempt, 16)
+            logger.warning("Temporary Telegram network error: %s; retrying in %ds", exc, wait_seconds)
+            await asyncio.sleep(wait_seconds)
+    if last_error:
+        raise last_error
+    raise RuntimeError("Telegram send failed without a result")
+
+
+async def send_single_file(context: ContextTypes.DEFAULT_TYPE, chat_id: int, path: str, caption: str):
+    """Send one file as photo / animation / audio / document, with retries."""
+    ext = path.rsplit(".", 1)[-1].lower()
+    caption = (caption or "")[:900]
+    size = os.path.getsize(path)
+    dimensions = _image_dimensions(path) if ext in PHOTO_EXTS else None
+    use_photo = ext in PHOTO_EXTS and size <= TELEGRAM_PHOTO_SIZE_LIMIT
+    if dimensions:
+        width, height = dimensions
+        # Telegram rejects photos where width+height > 10000 or aspect ratio > 20
+        if width + height > 10000 or max(width, height) / max(min(width, height), 1) > 20:
+            use_photo = False
+    if size > TELEGRAM_DOC_SIZE_LIMIT:
+        raise ValueError(f"file is {size / (1024 * 1024):.1f} MiB, above the safe Telegram upload limit")
+
+    async def _send():
+        if ext == "gif":
+            with open(path, "rb") as f:
+                return await context.bot.send_animation(chat_id=chat_id, animation=f, caption=caption, **UPLOAD_TIMEOUTS)
+        if use_photo:
+            try:
+                with open(path, "rb") as f:
+                    return await context.bot.send_photo(chat_id=chat_id, photo=f, caption=caption, **UPLOAD_TIMEOUTS)
+            except BadRequest as exc:
+                logger.info("Telegram rejected photo %s; retrying as document: %s", path, exc)
+        if ext in AUDIO_EXTS:
+            with open(path, "rb") as f:
+                return await context.bot.send_audio(chat_id=chat_id, audio=f, caption=caption, **UPLOAD_TIMEOUTS)
+        with open(path, "rb") as f:
+            return await context.bot.send_document(chat_id=chat_id, document=f, caption=caption, **UPLOAD_TIMEOUTS)
+
+    return await _send_with_telegram_retry(_send)
+
+
+ALBUM_SIZE = 10          # Telegram's maximum items per album (media group)
+ALBUM_PAUSE_SECONDS = 2.0
+
+
+def _photo_eligible(path: str) -> bool:
+    """Can Telegram show this file as a photo (size, dimensions and aspect ratio limits)?"""
+    ext = path.rsplit(".", 1)[-1].lower()
+    if ext not in PHOTO_EXTS or os.path.getsize(path) > TELEGRAM_PHOTO_SIZE_LIMIT:
+        return False
+    dims = _image_dimensions(path)
+    if dims:
+        w, h = dims
+        if w + h > 10000 or max(w, h) / max(min(w, h), 1) > 20:
+            return False
+    return True
+
+
+def album_kind(path: str) -> str:
+    ext = path.rsplit(".", 1)[-1].lower()
+    if ext == "gif":
+        return "anim"       # animations cannot be put in albums
+    if ext in AUDIO_EXTS:
+        return "audio"
+    return "photo" if _photo_eligible(path) else "doc"
+
+
+async def send_album(context: ContextTypes.DEFAULT_TYPE, chat_id: int, paths: List[str], kind: str, caption: str):
+    """Send 2-10 files as ONE album message group (all photos, all documents, or all audio)."""
+    media_cls = {"photo": InputMediaPhoto, "doc": InputMediaDocument, "audio": InputMediaAudio}[kind]
+
+    async def _send():
+        with contextlib.ExitStack() as stack:   # files stay open until Telegram has them; reopened on retry
+            media = [media_cls(media=stack.enter_context(open(p, "rb")), caption=(caption[:900] if i == 0 else None))
+                     for i, p in enumerate(paths)]
+            return await context.bot.send_media_group(chat_id=chat_id, media=media, **UPLOAD_TIMEOUTS)
+
+    return await _send_with_telegram_retry(_send)
+
+
+async def deliver_as_albums(context, chat_id: int, paths: List[str], label: str, query: str, status_msg=None):
+    """
+    "Send individually" delivery. Files go out in albums of up to 10 instead of one message
+    per file (which took ~1.1 s each and flooded the chat). Photos, documents (large / 6K
+    images) and audio are grouped separately because Telegram cannot mix them in one album;
+    GIFs are sent as animations. A failed album falls back to one-by-one so nothing is lost.
+    Returns (sent_count, error_messages).
+    """
+    groups = {"photo": [], "doc": [], "audio": [], "anim": []}
+    for p in paths:
+        groups[album_kind(p)].append(p)
+    total, sent, errors = len(paths), 0, []
+
+    async def single(p):
+        nonlocal sent
+        try:
+            await send_single_file(context, chat_id, p, caption=f"[{label}] “{query}”")
+            sent += 1
+        except Exception as exc:
+            errors.append(str(exc))
+            logger.exception("[%s] failed to send %s", label, p)
+
+    for kind in ("photo", "doc", "audio"):
+        items = groups[kind]
+        for i in range(0, len(items), ALBUM_SIZE):
+            batch = items[i:i + ALBUM_SIZE]
+            if len(batch) == 1:
+                await single(batch[0])
+            else:
+                caption = f"[{label}] “{query}” — {sent + 1}-{sent + len(batch)} of {total}"
+                try:
+                    await send_album(context, chat_id, batch, kind, caption)
+                    sent += len(batch)
+                except Exception:
+                    logger.exception("[%s] album failed; sending its %d files one by one", label, len(batch))
+                    for p in batch:
+                        await single(p)
+                        await asyncio.sleep(1.1)
+            if status_msg is not None:
+                await safe_edit(status_msg, f"[{label}] Sending… {sent}/{total} delivered.")
+            await asyncio.sleep(ALBUM_PAUSE_SECONDS)   # stay inside Telegram's per-chat rate limit
+    for p in groups["anim"]:
+        await single(p)
+        await asyncio.sleep(1.1)
+    return sent, errors
+
+
+async def safe_edit(msg, text: str, **kwargs):
+    """edit_text that never crashes a job ("message is not modified", flood limits...)."""
+    try:
+        return await msg.edit_text(text, **kwargs)
+    except BadRequest as exc:
+        if "not modified" not in str(exc).lower():
+            logger.info("edit_text failed: %s", exc)
+    except Exception as exc:
+        logger.info("edit_text failed: %s", exc)
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Telegram handlers
+# ---------------------------------------------------------------------------
+
+START_TEXT = (
+    "👋 Send me a word or phrase and pick what you need:\n\n"
+    "1️⃣ Stock — Pexels, Pixabay, Unsplash, Openverse, Open Media, or a random mix of all\n"
+    "2️⃣ GIF — Giphy\n"
+    "3️⃣ Sound — Freesound sound effects\n"
+    "4️⃣ Anime — Safebooru, Yande.re, Konachan, Danbooru, Gelbooru, or a random mix of all\n\n"
+    "After you pick a source, the bot suggests related words/tags for what you typed.\n"
+    "Then choose count, resolution (anime also offers 6K/7K/8K/10K+) and delivery "
+    "(one zip, or albums of up to 10 files).\n\n"
+    "Power commands:\n"
+    "/search <query> [count] [provider] [type:png|jpg|gif] [minscore:N]\n"
+    "/overlay arrow red up-right\n"
+    "/providers — see what is configured\n"
+    "/help — details"
+)
+
+
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(START_TEXT)
+
+
+
+# ---------------------------------------------------------------------------
+# /overlay -- locally generated thumbnail elements (arrows, circles, boxes,
+# stars) as transparent PNGs. Generated rather than fetched: the free
+# icon/clipart sites that carry these (Flaticon, Icons8, Noun Project) all
+# require attribution or a paid plan for commercial use, whereas a shape this
+# simple has no licensing strings at all when drawn here.
+# ---------------------------------------------------------------------------
+OVERLAY_SHAPES = ["arrow", "circle", "box", "star"]
+OVERLAY_COLORS = {
+    "red": (255, 32, 32),
+    "yellow": (255, 214, 0),
+    "green": (40, 200, 60),
+    "blue": (30, 120, 255),
+    "orange": (255, 140, 0),
+    "pink": (255, 60, 160),
+    "white": (255, 255, 255),
+    "black": (0, 0, 0),
+}
+# Arrow directions -> counter-clockwise rotation in degrees from "pointing right".
+OVERLAY_DIRECTIONS = {
+    "right": 0, "up-right": 45, "up": 90, "up-left": 135,
+    "left": 180, "down-left": 225, "down": 270, "down-right": 315,
+}
+_OVERLAY_CANVAS = 1024   # drawn at this size, then downscaled 2x for smooth edges
+_OVERLAY_OUT = 512
+
+
+def _hex_to_rgb(token: str):
+    t = token.lstrip("#")
+    if len(t) == 6:
+        try:
+            return tuple(int(t[i:i + 2], 16) for i in (0, 2, 4))
+        except ValueError:
+            return None
+    return None
+
+
+def render_overlay(shape: str, color, direction: str = "right", out_path: str = "overlay.png") -> str:
+    """Draws one shape as a transparent RGBA PNG at out_path. Blocking (Pillow) -- call via a thread."""
+    S = _OVERLAY_CANVAS
+    img = Image.new("RGBA", (S, S), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    fill = tuple(color) + (255,)
+    outline = (0, 0, 0, 255) if sum(color) > 90 else (255, 255, 255, 255)
+    ow = 22  # outline width so the shape stays visible on any background
+
+    if shape == "arrow":
+        pts = [(100, 420), (560, 420), (560, 250), (940, 512), (560, 774), (560, 604), (100, 604)]
+        d.polygon(pts, fill=fill)
+        d.line(pts + [pts[0]], fill=outline, width=ow, joint="curve")
+    elif shape == "circle":
+        box = (90, 150, 934, 874)
+        d.ellipse(box, outline=outline, width=96)
+        d.ellipse((box[0] + 13, box[1] + 13, box[2] - 13, box[3] - 13), outline=fill, width=70)
+    elif shape == "box":
+        box = (100, 180, 924, 844)
+        d.rectangle(box, outline=outline, width=96)
+        d.rectangle((box[0] + 13, box[1] + 13, box[2] - 13, box[3] - 13), outline=fill, width=70)
+    elif shape == "star":
+        cx = cy = S / 2
+        outer, inner = 430, 180
+        pts = []
+        for i in range(10):
+            r = outer if i % 2 == 0 else inner
+            a = math.radians(-90 + i * 36)
+            pts.append((cx + r * math.cos(a), cy + r * math.sin(a)))
+        d.polygon(pts, fill=fill)
+        d.line(pts + [pts[0]], fill=outline, width=ow, joint="curve")
+    else:
+        raise ValueError(f"unknown shape {shape!r}")
+
+    if shape == "arrow" and OVERLAY_DIRECTIONS.get(direction, 0):
+        img = img.rotate(OVERLAY_DIRECTIONS[direction], resample=Image.BICUBIC, expand=False)
+    img = img.resize((_OVERLAY_OUT, _OVERLAY_OUT), Image.LANCZOS)
+    img.save(out_path, "PNG")
+    return out_path
+
+
+async def _send_overlay(context: ContextTypes.DEFAULT_TYPE, chat_id: int, shape: str, color_name: str,
+                        rgb, direction: str):
+    job_dir = os.path.join(WORKDIR, f"overlay_{chat_id}_{uuid.uuid4().hex}")
+    os.makedirs(job_dir, exist_ok=True)
+    try:
+        suffix = f"_{direction}" if shape == "arrow" else ""
+        path = os.path.join(job_dir, f"{shape}_{color_name}{suffix}.png")
+        await asyncio.to_thread(render_overlay, shape, rgb, direction, path)
+        # send_document (not send_photo) so Telegram doesn't flatten the transparency.
+        with open(path, "rb") as f:
+            await context.bot.send_document(chat_id=chat_id, document=f, caption=f"{shape} · {color_name}{suffix}")
+    finally:
+        shutil.rmtree(job_dir, ignore_errors=True)
+
+
+async def overlay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/overlay [shape] [color|#hex] [direction] -- tokens in any order. No args opens a button menu."""
+    args = [a.lower() for a in (context.args or [])]
+    if not args:
+        rows = [[(s.title(), f"ov|shape|{s}") for s in OVERLAY_SHAPES[:2]],
+                [(s.title(), f"ov|shape|{s}") for s in OVERLAY_SHAPES[2:]]]
+        await update.message.reply_text("What kind of overlay?", reply_markup=_wiz_kb(rows))
+        return
+
+    shape, color_name, rgb, direction = None, "red", OVERLAY_COLORS["red"], "right"
+    for a in args:
+        if a in OVERLAY_SHAPES:
+            shape = a
+        elif a in OVERLAY_COLORS:
+            color_name, rgb = a, OVERLAY_COLORS[a]
+        elif a in OVERLAY_DIRECTIONS:
+            direction = a
+        elif _hex_to_rgb(a):
+            color_name, rgb = a.lstrip("#"), _hex_to_rgb(a)
+        else:
+            await update.message.reply_text(
+                f"Didn't understand “{a}”. Usage: /overlay <{'|'.join(OVERLAY_SHAPES)}> "
+                f"[{'|'.join(OVERLAY_COLORS)}|#hex] [{'|'.join(OVERLAY_DIRECTIONS)}]"
+            )
+            return
+    if not shape:
+        await update.message.reply_text(f"Pick a shape: {', '.join(OVERLAY_SHAPES)}")
+        return
+    await _send_overlay(context, update.effective_chat.id, shape, color_name, rgb, direction)
+
+
+async def handle_overlay_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cb = update.callback_query
+    await cb.answer()
+    parts = (cb.data or "").split("|")
+    if len(parts) < 3 or parts[0] != "ov":
+        return
+    step, value = parts[1], parts[2]
+    chat_id = cb.message.chat_id
+
+    if step == "shape":
+        names = list(OVERLAY_COLORS)
+        rows = [[(n.title(), f"ov|color|{n}|{value}") for n in names[i:i + 4]] for i in range(0, len(names), 4)]
+        await cb.edit_message_text(f"{value.title()} — which color?", reply_markup=_wiz_kb(rows))
+        return
+
+    if step == "color" and len(parts) >= 4:
+        shape = parts[3]
+        if shape == "arrow":
+            dirs = list(OVERLAY_DIRECTIONS)
+            rows = [[(n, f"ov|dir|{n}|{value}") for n in dirs[i:i + 4]] for i in range(0, len(dirs), 4)]
+            await cb.edit_message_text(f"{value.title()} arrow — which direction?", reply_markup=_wiz_kb(rows))
+            return
+        await cb.edit_message_text(f"Generating {value} {shape}…")
+        await _send_overlay(context, chat_id, shape, value, OVERLAY_COLORS[value], "right")
+        return
+
+    if step == "dir" and len(parts) >= 4:
+        color_name = parts[3]
+        await cb.edit_message_text(f"Generating {color_name} arrow ({value})…")
+        await _send_overlay(context, chat_id, "arrow", color_name, OVERLAY_COLORS[color_name], value)
+        return
+
+
+
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # Plain text on purpose: names like GELBOORU_API_KEY contain underscores
+    # that Telegram's Markdown parser treats as italics and rejects.
+    await update.message.reply_text(
+        "QUICK MODE\n"
+        "Type any word or phrase and choose:\n"
+        "1. Stock: Pexels, Pixabay, Unsplash, Openverse, Open Media (Wikimedia Commons), or 🎲 random from all\n"
+        "2. GIF (Giphy)\n"
+        "3. Sound (Freesound, CC0/Attribution only)\n"
+        "4. Anime: Safebooru, Yande.re, Konachan, Danbooru, Gelbooru, or 🎲 random from all\n\n"
+        "Every path first offers suggestions for your word (tags for anime, related terms for stock/sound, Giphy tags for GIF), "
+        "then asks for count (5-30), minimum resolution and delivery (one zip, or albums of up to 10 files). "
+        "Anime resolution also offers 6K+, 7K+, 8K+, 10K+ and a custom 6000-30000 px threshold, "
+        "measured on the image's longest side. Images over Telegram's 50 MB limit are re-encoded "
+        "as same-size JPEG so they can still be delivered.\n\n"
+        "Anime sources only return safe/general-rated art. Gelbooru needs GELBOORU_API_KEY and "
+        "GELBOORU_USER_ID. Konachan / Yande.re / Safebooru / Danbooru need no key. "
+        "In the random mix, a source that is blocked or unconfigured is skipped and reported.\n\n"
+        "FULL CONTROL\n"
+        "/search <query> [count] [provider] [type:png|jpg|gif|mp3] [minscore:N]\n"
+        f"  providers: {', '.join(PROVIDERS)}\n"
+        "  e.g. /search hatsune_miku 20 yandere type:png minscore:80\n"
+        "  e.g. /search mount fuji 15 stockmix\n"
+        "  e.g. /search shinobu_oshino 12 animemix\n"
+        "  (/search always zips; use the buttons for album delivery or sort/resolution choices)\n"
+        "/providers — list enabled providers\n"
+        "/overlay — thumbnail arrows/circles/boxes/stars, e.g. /overlay arrow red up-right\n\n"
+        "Booru tags use Japanese name order (furudo_erika, not erika_furudo); the bot looks tags up for you.\n"
+        "All keys live in your environment/.env — see the README."
+    )
+
+
+async def providers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    on = configured_providers()
+    off = [(n, provider_ready(n)[1]) for n in PROVIDERS if not provider_ready(n)[0] and n not in DEPRECATED_PROVIDERS]
+    text = "Enabled: " + ", ".join(on) if on else "No providers are enabled yet."
+    if off:
+        text += "\n\nNot enabled (missing setting):\n" + "\n".join(f"• {n}: {hint}" for n, hint in off)
+    await update.message.reply_text(text)
+
+
+def parse_search_args(raw_args: List[str]):
+    """[count] [provider] [type:png|jpg|gif] [minscore:N] after the query, any order."""
+    args = list(raw_args)
+    provider = DEFAULT_PROVIDER if DEFAULT_PROVIDER in PROVIDERS else "pexels"
+    count = None
+    extra = {}
+
+    remaining = []
+    for tok in args:
+        m = re.fullmatch(r"(type|filetype|minscore|min_score|score)\s*:\s*(\S+)", tok, re.IGNORECASE)
+        if m:
+            key, val = m.group(1).lower(), m.group(2)
+            if key in ("type", "filetype"):
+                extra["file_type"] = val.lower().lstrip(".")
+            elif re.fullmatch(r"-?\d+", val):
+                extra["minscore"] = val
+        else:
+            remaining.append(tok)
+    args = remaining
+
+    provider_set = False
+    for _ in range(2):
+        if args and not provider_set and args[-1].lower() in PROVIDERS:
+            provider = args.pop().lower()
+            provider_set = True
+        elif args and count is None and re.fullmatch(r"\d+", args[-1]):
+            count = max(1, min(int(args.pop()), MAX_COUNT))
+
+    return " ".join(args).strip(), count, provider, extra
+
+
+async def search_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query, count, provider, extra = parse_search_args(context.args)
+    chat_id = update.effective_chat.id
+
+    if not query:
+        await update.message.reply_text("Usage: /search <query> [count] [provider]")
+        return
+    if provider not in PROVIDERS:
+        await update.message.reply_text(f"Unknown provider '{provider}'. Choose from: {', '.join(PROVIDERS)}")
+        return
+    if provider in DEPRECATED_PROVIDERS:
+        await update.message.reply_text(f"⚠️ {DEPRECATED_PROVIDERS[provider]}")
+        return
+    ready, hint = provider_ready(provider)
+    if not ready:
+        await update.message.reply_text(f"'{provider}' is not enabled — set {hint} and restart. See /providers.")
+        return
+
+    if count is None:
+        count = WEB_ENGINE_DEFAULT_COUNT if provider in WEB_ENGINE_PROVIDERS else DEFAULT_COUNT
+
+    status_bits = f"🔎 Searching {provider} for “{query}”"
+    if extra.get("file_type"):
+        status_bits += f" (type:{extra['file_type']})"
+    if extra.get("minscore"):
+        status_bits += f" (minscore:{extra['minscore']})"
+    status_msg = await update.message.reply_text(status_bits + "…")
+    await run_search_job(context, chat_id, query, count, provider, extra, status_msg, label=provider)
+
+
+# ---------------------------------------------------------------------------
+# Menu + wizard
+#
+#   main menu:  1 Stock   2 GIF   3 Sound   4 Anime
+#   stock  ->   Pexels / Pixabay / Unsplash / Openverse / Open Media / Random from all
+#   anime  ->   Safebooru / Yande.re / Konachan / Danbooru / Gelbooru / Random from all
+#   then: (tag lookup for single anime sources) -> sort -> count -> resolution -> delivery
+# ---------------------------------------------------------------------------
+
+STOCK_MENU = [
+    ("📷 Pexels", "pexels"),
+    ("🖼 Pixabay", "pixabay"),
+    ("📸 Unsplash", "unsplash"),
+    ("🌐 Openverse", "openverse"),
+    ("🌍 Open Media", "openmedia"),
+    ("🎲 Random from all", "stockmix"),
+]
+ANIME_MENU = [
+    ("🎌 Safebooru", "safebooru"),
+    ("🌸 Yande.re", "yandere"),
+    ("🎨 Konachan", "konachan"),
+    ("🅳 Danbooru", "danbooru"),
+    ("🅶 Gelbooru", "gelbooru"),
+    ("🎲 Random from all", "animemix"),
+]
+# wizard category id -> provider used
+CATEGORY_PROVIDER = {
+    **{cat: cat for _, cat in STOCK_MENU},
+    **{cat: cat for _, cat in ANIME_MENU},
+    "gif": "giphy",
+    "sfx": "freesound",
+}
+CATEGORY_LABELS = {
+    **{cat: label for label, cat in STOCK_MENU},
+    **{cat: label for label, cat in ANIME_MENU},
+    "gif": "🎞 GIF",
+    "sfx": "🔊 Sound",
+}
+PLAIN_TEXT_COUNT = 10
+
+SORT_OPTIONS = {
+    "pixabay": [("🔥 Popular", "popular"), ("🆕 Latest", "latest")],
+    "unsplash": [("🔍 Relevant", "popular"), ("🆕 Latest", "latest")],
+    "sfx": [("🔥 Popular", "popular"), ("🆕 Newest", "new"), ("🔍 Best match", "relevance")],
+}
+BOORU_SORT_OPTIONS = [("🔥 Top (score)", "score"), ("🆕 New", "new"), ("🎲 Random", "random")]
+ANIME_SITE_SORT_OPTIONS = {
+    "safebooru": BOORU_SORT_OPTIONS,
+    "yandere": BOORU_SORT_OPTIONS,
+    "konachan": BOORU_SORT_OPTIONS,
+    "gelbooru": BOORU_SORT_OPTIONS,
+    "danbooru": [("🔥 Top (score)", "score"), ("🎲 Random", "random")],
+}
+ANIME_SITE_AUTOCOMPLETE = {
+    "safebooru": safebooru_autocomplete,
+    "yandere": yandere_autocomplete,
+    "konachan": konachan_autocomplete,
+    "danbooru": danbooru_safe_autocomplete,
+    "gelbooru": gelbooru_autocomplete,
+}
+
+COUNT_OPTIONS = [5, 10, 15, 20, 30]
+SIZE_OPTIONS = [("Any size", "any"), ("HD (≥1280px)", "hd"), ("Full HD (≥1920px)", "fhd")]
+# Anime-only: minimum of the image's LONGEST side, verified on the downloaded file.
+ANIME_DIMENSION_OPTIONS = [
+    ("🧩 6K+ (6,000px)", "min:6000"),
+    ("🧩 7K+ (7,000px)", "min:7000"),
+    ("🧩 8K+ (8,000px)", "min:8000"),
+    ("🧩 10K+ (10,000px)", "min:10000"),
+    ("✏️ Custom…", "custom"),
+]
+DELIVERY_OPTIONS = [("📦 Zip file", "zip"), ("🖼 Send as albums", "individual")]
+
+PENDING_SEARCHES: dict = {}
+PENDING_TTL_SECONDS = 30 * 60
+
+
+def _new_pending(query: str) -> str:
+    now = time.time()
+    for k in [k for k, v in PENDING_SEARCHES.items() if now - v.get("created", 0) > PENDING_TTL_SECONDS]:
+        PENDING_SEARCHES.pop(k, None)
+    search_id = uuid.uuid4().hex[:10]
+    PENDING_SEARCHES[search_id] = {"query": query, "text": query, "created": now}
+    return search_id
+
+
+def _wiz_kb(rows):
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=cd) for label, cd in row] for row in rows])
+
+
+def _delivery_keyboard(search_id: str):
+    return _wiz_kb([[(label, f"wz|deliver|{value}|{search_id}") for label, value in DELIVERY_OPTIONS]])
+
+
+def _main_menu(search_id: str):
+    return _wiz_kb([
+        [("1️⃣ 📷 Stock", f"wz|menu|stock|{search_id}")],
+        [("2️⃣ 🎞 GIF", f"wz|menu|gif|{search_id}")],
+        [("3️⃣ 🔊 Sound", f"wz|menu|sound|{search_id}")],
+        [("4️⃣ 🎌 Anime", f"wz|menu|anime|{search_id}")],
+    ])
+
+
+def _sub_menu(items, search_id: str):
+    row = [(label, f"wz|cat|{cat}|{search_id}") for label, cat in items]
+    rows = [row[i:i + 2] for i in range(0, len(row), 2)]
+    rows.append([("⬅️ Back", f"wz|menu|main|{search_id}")])
+    return _wiz_kb(rows)
+
+
+async def autocomplete_with_fallbacks(fn, text: str, limit: int = 8) -> List[str]:
+    """Tag lookup; also tries reversed word order and single words (booru tags use Japanese order)."""
+    text = re.sub(r"\s+", "_", text.strip())   # booru tags use underscores, never spaces
+    found = await fn(text, limit)
+    if found:
+        return found
+    words = [w for w in re.split(r"[\s_\-]+", text.strip()) if len(w) >= 3]
+    attempts = []
+    if len(words) >= 2:
+        attempts.append("_".join(reversed(words)))
+    attempts += sorted(set(words), key=len, reverse=True)[:2]
+    attempts = [a for a in dict.fromkeys(attempts) if a.lower() != text.strip().lower()]
+    if not attempts:
+        return []
+    batches = await asyncio.gather(*[fn(a, limit) for a in attempts], return_exceptions=True)
+    merged: List[str] = []
+    for batch in batches:
+        if isinstance(batch, list):
+            merged += [t for t in batch if t not in merged]
+    return merged[:limit]
+
+
+async def suggest_terms(category: str, text: str, limit: int = 8) -> List[str]:
+    """
+    Suggestions for non-booru sources. Pexels/Pixabay/Unsplash/Openverse/Freesound
+    have no autocomplete API, so related/completed search terms come from
+    Datamuse (keyless); GIF uses Giphy's own tag suggestions first.
+    Never raises -- no suggestions simply means the search continues as typed.
+    """
+    text = text.strip()
+    if len(text) < 2:
+        return []
+
+    async def giphy():
+        if not GIPHY_API_KEY:
+            return []
+        data = await _autocomplete_get("https://api.giphy.com/v1/gifs/search/tags",
+                                       {"api_key": GIPHY_API_KEY, "q": text, "limit": limit})
+        items = data.get("data") if isinstance(data, dict) else []
+        return [i["name"] for i in items or [] if isinstance(i, dict) and i.get("name")]
+
+    async def datamuse():
+        sug, rel = await asyncio.gather(
+            _autocomplete_get("https://api.datamuse.com/sug", {"s": text, "max": limit}),
+            _autocomplete_get("https://api.datamuse.com/words", {"ml": text, "max": limit}),
+        )
+        return [i["word"] for i in list(sug or []) + list(rel or []) if isinstance(i, dict) and i.get("word")]
+
+    sources = [giphy(), datamuse()] if category == "gif" else [datamuse()]
+    batches = await asyncio.gather(*sources, return_exceptions=True)
+    out: List[str] = []
+    for batch in batches:
+        for term in batch if isinstance(batch, list) else []:
+            if term.lower() != text.lower() and term not in out:
+                out.append(term)
+    return out[:limit]
+
+
+async def _suggestions_for(entry: dict, text: str) -> List[str]:
+    category = entry["category"]
+    if category == "animemix":
+        # Booru tags from two fast keyless sites, interleaved.
+        lists = await asyncio.gather(
+            autocomplete_with_fallbacks(safebooru_autocomplete, text),
+            autocomplete_with_fallbacks(yandere_autocomplete, text),
+            return_exceptions=True)
+        lists = [x for x in lists if isinstance(x, list)]
+        merged: List[str] = []
+        for i in range(max((len(x) for x in lists), default=0)):
+            merged += [x[i] for x in lists if i < len(x) and x[i] not in merged]
+        return merged[:8]
+    if category in ANIME_CATEGORY_IDS:
+        return await autocomplete_with_fallbacks(ANIME_SITE_AUTOCOMPLETE[entry["provider"]], text)
+    return await suggest_terms(category, text)
+
+
+async def _continue_after_query(reply, entry: dict, search_id: str, prefix: str = ""):
+    """The search term is settled: go to sort (if the source has one) or straight to count."""
+    category = entry["category"]
+    count_kb = _wiz_kb([[(str(n), f"wz|count|{n}|{search_id}") for n in COUNT_OPTIONS]])
+    if category == "animemix":
+        entry["sort"] = "random"
+        await reply(f"{prefix}🎲 Random mix. How many results?", reply_markup=count_kb)
+        return
+    if category in ANIME_CATEGORY_IDS:
+        options = ANIME_SITE_SORT_OPTIONS[entry["provider"]]
+    else:
+        options = SORT_OPTIONS.get(category)
+    if options:
+        kb = _wiz_kb([[(label, f"wz|sort|{val}|{search_id}") for label, val in options]])
+        await reply(f"{prefix}[{category}] Sort by:", reply_markup=kb)
+    else:
+        entry["sort"] = "relevance"
+        await reply(f"{prefix}[{category}] How many results?", reply_markup=count_kb)
+
+
+async def _suggest_step(reply, entry: dict, search_id: str, text: str):
+    """
+    Show suggestions for what the user typed (tags for anime sources, related terms
+    for everything else). `reply(text, reply_markup=...)` is edit_message_text or
+    reply_text. If nothing is found the search just continues with the typed text.
+    """
+    category = entry["category"]
+    is_anime = category in ANIME_CATEGORY_IDS
+    typed = (text if "," in text else text.replace(" ", "_")) if is_anime else text
+    suggestions = await _suggestions_for(entry, text)
+    label = CATEGORY_LABELS.get(category, category)
+    if suggestions:
+        entry["tag_suggestions"] = suggestions
+        entry["typed_fallback"] = typed
+        rows = [[(f"💡 {t}"[:60], f"wz|tagpick|{i}|{search_id}")] for i, t in enumerate(suggestions)]
+        rows.append([(f"✅ Use “{typed}”"[:60], f"wz|tagpick|-1|{search_id}")])
+        rows.append([("✏️ Type something else", f"wz|retag|0|{search_id}")])
+        kind = "tags" if is_anime else "suggestions"
+        await reply(f"{label} {kind} for “{text}”:", reply_markup=_wiz_kb(rows))
+    else:
+        entry["query"] = typed
+        await _continue_after_query(reply, entry, search_id, prefix=f"No suggestions for “{text}” — using it as typed.\n")
+
+
+async def handle_plain_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """A plain message opens the main menu (or answers a pending 'type a value' prompt)."""
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+
+    dimension_id = context.chat_data.pop("awaiting_anime_dimension", None)
+    if dimension_id:
+        entry = PENDING_SEARCHES.get(dimension_id)
+        if not entry:
+            await update.message.reply_text("That search expired. Send the search term again.")
+            return
+        token = re.sub(r"[, ]", "", text)
+        looks_numeric = re.fullmatch(r"\d+", token) is not None
+        if looks_numeric and not (re.fullmatch(r"\d{4,5}", token) and 6000 <= int(token) <= 30000):
+            context.chat_data["awaiting_anime_dimension"] = dimension_id
+            await update.message.reply_text("Enter a number between 6000 and 30000, for example 6500.")
+            return
+        if not looks_numeric:
+            # Not a number: the user moved on, so treat it as a brand-new search instead of trapping them.
+            search_id = _new_pending(text)
+            await update.message.reply_text(f"What do you need for “{text}”?", reply_markup=_main_menu(search_id))
+            return
+        entry["min_dimension"] = int(token)
+        entry["size"] = "any"
+        await update.message.reply_text(
+            f"Minimum longest side set to {int(token):,} px. Deliver as:",
+            reply_markup=_delivery_keyboard(dimension_id),
+        )
+        return
+
+    awaiting_id = context.chat_data.pop("awaiting_anime_tag", None)
+    if awaiting_id:
+        entry = PENDING_SEARCHES.get(awaiting_id)
+        if entry:
+            entry["text"] = text
+            await _suggest_step(update.message.reply_text, entry, awaiting_id, text)
+            return
+
+    search_id = _new_pending(text)
+    await update.message.reply_text(f"What do you need for “{text}”?", reply_markup=_main_menu(search_id))
+
+
+async def handle_wizard_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    cb = update.callback_query
+    try:
+        await cb.answer()
+    except Exception:   # "query is too old" after a restart/lag must not stop the action
+        pass
+
+    parts = (cb.data or "").split("|")
+    if len(parts) != 4 or parts[0] != "wz":
+        return
+    _, step, value, search_id = parts
+
+    entry = PENDING_SEARCHES.get(search_id)
+    if not entry:
+        await cb.edit_message_text("This search has expired — just send the word again.")
+        return
+    chat_id = cb.message.chat.id
+    text = entry.get("text", entry["query"])
+
+    # ---- menus -----------------------------------------------------------
+    if step == "menu":
+        context.chat_data.pop("awaiting_anime_tag", None)
+        if value == "main":
+            await cb.edit_message_text(f"What do you need for “{text}”?", reply_markup=_main_menu(search_id))
+        elif value == "stock":
+            await cb.edit_message_text(f"📷 Stock — where from? (“{text}”)",
+                                       reply_markup=_sub_menu(STOCK_MENU, search_id))
+        elif value == "anime":
+            await cb.edit_message_text(f"🎌 Anime — which source? (“{text}”)",
+                                       reply_markup=_sub_menu(ANIME_MENU, search_id))
+        elif value in ("gif", "sound"):
+            await _select_category(cb, entry, search_id, "gif" if value == "gif" else "sfx")
+        return
+
+    if step == "cat":
+        if value not in CATEGORY_PROVIDER:
+            await cb.edit_message_text("Unknown option — send the word again.")
+            return
+        await _select_category(cb, entry, search_id, value)
+        return
+
+    # ---- anime tag handling ----------------------------------------------
+    if step == "retag":
+        context.chat_data["awaiting_anime_tag"] = search_id
+        await cb.edit_message_text("Type the word, name or tag you want:")
+        return
+
+    if step == "tagpick":
+        idx = _safe_int(value, -1)
+        suggestions = entry.get("tag_suggestions", [])
+        chosen = suggestions[idx] if 0 <= idx < len(suggestions) else entry.get("typed_fallback", text)
+        entry["query"] = chosen
+        await _continue_after_query(cb.edit_message_text, entry, search_id, prefix=f"Using “{chosen}”.\n")
+        return
+
+    # ---- sort / count / resolution / delivery ----------------------------
+    if step == "sort":
+        entry["sort"] = value
+        keyboard = _wiz_kb([[(str(n), f"wz|count|{n}|{search_id}") for n in COUNT_OPTIONS]])
+        await cb.edit_message_text(f"[{entry['category']}] How many results?", reply_markup=keyboard)
+        return
+
+    if step == "count":
+        entry["count"] = _safe_int(value, PLAIN_TEXT_COUNT)
+        category = entry.get("category")
+        if category in ("sfx", "gif"):   # audio has no resolution; Giphy originals are ~480px so HD would match nothing
+            entry["size"] = "any"
+            await cb.edit_message_text(f"[{category}] Deliver as:", reply_markup=_delivery_keyboard(search_id))
+            return
+        options = SIZE_OPTIONS + (ANIME_DIMENSION_OPTIONS if category in ANIME_CATEGORY_IDS else [])
+        rows = [[(label, f"wz|size|{val}|{search_id}") for label, val in options[i:i + 2]]
+                for i in range(0, len(options), 2)]
+        await cb.edit_message_text(f"[{category}] Minimum resolution?", reply_markup=_wiz_kb(rows))
+        return
+
+    if step == "size":
+        is_anime = entry.get("category") in ANIME_CATEGORY_IDS
+        if value == "custom":
+            if not is_anime:
+                await cb.edit_message_text("Custom 6K+ filtering is available only for anime searches.")
+                return
+            context.chat_data["awaiting_anime_dimension"] = search_id
+            await cb.edit_message_text("Send the minimum longest side in pixels (6000–30000), for example 6500:")
+            return
+        if value.startswith("min:"):
+            if not is_anime:
+                await cb.edit_message_text("6K+ filtering is available only for anime searches.")
+                return
+            threshold = _safe_int(value.split(":", 1)[1])
+            entry["min_dimension"] = threshold
+            entry["size"] = "any"
+            await cb.edit_message_text(
+                f"Images must have a longest side of at least {threshold:,} px. Deliver as:",
+                reply_markup=_delivery_keyboard(search_id))
+            return
+        entry["size"] = value
+        entry["min_dimension"] = 0
+        await cb.edit_message_text(f"[{entry['category']}] Deliver as:", reply_markup=_delivery_keyboard(search_id))
+        return
+
+    if step == "deliver":
+        category = entry.get("category")
+        provider = entry.get("provider")
+        if not category or not provider:
+            await cb.edit_message_text("This search is incomplete — send the word again.")
+            return
+        extra = {
+            "sort": entry.get("sort"),
+            "size": entry.get("size", "any"),
+            "min_dimension": entry.get("min_dimension", 0),
+        }
+        status_msg = await cb.edit_message_text(f"[{category}] 🔎 Searching for “{entry['query']}”…")
+        PENDING_SEARCHES.pop(search_id, None)
+        await run_search_job(
+            context, chat_id, entry["query"], entry.get("count", PLAIN_TEXT_COUNT), provider, extra,
+            status_msg, label=category, delivery=value,
+        )
+        return
+
+
+async def _select_category(cb, entry: dict, search_id: str, category: str):
+    """A concrete source/category was chosen: check it is usable, then start its wizard path."""
+    provider = CATEGORY_PROVIDER[category]
+    text = entry.get("text", entry["query"])
+    ready, hint = provider_ready(provider)
+    if not ready:
+        back = "anime" if category in ANIME_CATEGORY_IDS else "stock" if category in dict((c, 1) for _, c in STOCK_MENU) else "main"
+        await cb.edit_message_text(
+            f"⚠️ {CATEGORY_LABELS.get(category, category)} isn't set up yet. "
+            f"Add {hint} to the bot's environment variables and restart.\n\nPick another option:",
+            reply_markup=_wiz_kb([[("⬅️ Back", f"wz|menu|{back}|{search_id}")]]),
+        )
+        return
+
+    entry.update({"category": category, "provider": provider, "query": text,
+                  "min_dimension": 0, "size": "any"})
+    entry.pop("sort", None)
+
+    await cb.edit_message_text(f"🔎 Looking up suggestions for “{text}”…")
+    await _suggest_step(cb.edit_message_text, entry, search_id, text)
+
+
+# ---------------------------------------------------------------------------
+# The search -> download -> deliver pipeline
+# ---------------------------------------------------------------------------
+
+async def run_search_job(
+    context: ContextTypes.DEFAULT_TYPE,
+    chat_id: int,
+    query: str,
+    count: int,
+    provider: str,
+    extra: dict,
+    status_msg,
+    label: Optional[str] = None,
+    delivery: str = "zip",
+):
+    """
+    Search -> download (in waves until `count` VALID files exist) -> zip or send
+    individually. Each job has its own uuid-named directory so concurrent jobs
+    can never delete each other's files.
+    """
+    label = re.sub(r"[^A-Za-z0-9_-]+", "_", label or provider)
+    extra = {k: v for k, v in (extra or {}).items() if v is not None}
+    file_type = extra.get("file_type")
+    size = extra.get("size") or ("any" if provider in SKIP_ORIENTATION_FILTER else "hd")
+    min_dimension = _safe_int(extra.get("min_dimension"))
+    is_anime = provider in ANIME_CATEGORY_IDS
+    big_search = is_anime and min_dimension >= 6000
+    job_dir = os.path.join(WORKDIR, f"job_{chat_id}_{label}_{uuid.uuid4().hex}")
+    os.makedirs(job_dir, exist_ok=True)
+
+    if big_search:
+        # High-resolution art is rare: ask for a deep candidate pool and verify real dimensions.
+        fetch_n = min(MAX_ANIME_6K_CANDIDATES, max(count * 5, count))
+        candidate_cap = fetch_n
+    else:
+        fetch_n = count * (3 if file_type else 2)
+        candidate_cap = max(count * 3, count + 8)
+    job_timeout = min(90 + math.ceil(candidate_cap / CONCURRENT_DOWNLOADS) * DOWNLOAD_TIMEOUT, 3600)
+
+    try:
+        async def _do_job():
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT),
+                                             headers=HTTP_HEADERS) as session:
+                search_output = await PROVIDERS[provider](session, query, fetch_n, **extra)
+                provider_errors = list(getattr(search_output, "provider_errors", []))
+                raw_results = dedupe_image_results(search_output)
+                logger.info("[%s/%s] %d unique raw results for %r (asked %d)",
+                            label, provider, len(raw_results), query, fetch_n)
+
+                # A type filter is verified on the downloaded bytes, not the URL.
+                typed = raw_results if file_type else [r for r in raw_results if matches_file_type(r, None)]
+
+                if is_anime:
+                    threshold = SIZE_THRESHOLDS.get(size, 0)
+                    filtered = [i for i in typed if i.width <= 0 or i.height <= 0 or max(i.width, i.height) >= threshold]
+                else:
+                    filtered = [r for r in typed if passes_size_filter(r, size, provider not in SKIP_ORIENTATION_FILTER)]
+
+                if big_search:
+                    filtered = [i for i in filtered
+                                if i.width <= 0 or i.height <= 0 or max(i.width, i.height) >= min_dimension]
+                    filtered.sort(key=lambda i: (max(i.width, i.height), i.score or 0), reverse=True)
+                    # Known-large first, but keep sources represented in a random mix.
+                    if provider == "animemix":
+                        filtered.sort(key=lambda i: (0 if i.width > 0 and i.height > 0 else 1, random.random()))
+
+                chosen = filtered[:candidate_cap]
+                if not chosen:
+                    msg = f"[{label}] No results found for “{query}”"
+                    if file_type:
+                        msg += f" (type:{file_type})"
+                    if big_search:
+                        msg += f" at {min_dimension:,}px+"
+                    if provider_errors:
+                        msg += "\nSources unavailable: " + "; ".join(provider_errors[:5])
+                    await safe_edit(status_msg, msg + ".")
+                    return
+
+                suffix = f" (looking for {min_dimension:,}px+ originals)" if big_search else ""
+                await safe_edit(status_msg, f"[{label}] ⬇️ Downloading… 0/{count}{suffix}")
+
+                async def progress(done, need, tried, total):
+                    await safe_edit(status_msg, f"[{label}] ⬇️ {done}/{need} ready ({tried}/{total} candidates tried){suffix}")
+
+                paths, failures, shrunk = await collect_media(
+                    session, chosen, job_dir, count, file_type, min_dimension, progress)
+
+            if not paths:
+                if big_search:
+                    msg = (f"[{label}] No downloaded image reached {min_dimension:,} px on its longest side. "
+                           f"Try another tag/source, a lower threshold, or raise MAX_ANIME_6K_CANDIDATES "
+                           f"(now {MAX_ANIME_6K_CANDIDATES}).")
+                elif file_type:
+                    msg = f"[{label}] None of the results were actually {file_type} files."
+                else:
+                    msg = f"[{label}] All {len(chosen)} candidate downloads failed or were invalid."
+                if provider_errors:
+                    msg += "\nSources unavailable: " + "; ".join(provider_errors[:5])
+                await safe_edit(status_msg, msg + " Try a different query or source.")
+                return
+
+            notes = ""
+            if len(paths) < count:
+                notes += f"\nℹ️ Only {len(paths)} of {count} valid files could be found."
+            if shrunk:
+                notes += f"\nℹ️ {shrunk} file(s) over Telegram's 50 MB limit were re-encoded as same-size JPEG."
+            if failures:
+                notes += f"\nℹ️ {failures} candidate(s) skipped (dead links, blocks, wrong type or too small)."
+            if provider_errors:
+                notes += "\n⚠️ Some sources were unavailable: " + "; ".join(provider_errors[:5])
+
+            safe_query = re.sub(r"[^a-zA-Z0-9]+", "_", query)[:30]
+
+            if delivery == "individual":
+                await safe_edit(status_msg, f"[{label}] 🖼 Sending {len(paths)} files…")
+                sent, failed = await deliver_as_albums(context, chat_id, paths, label, query, status_msg)
+                summary = f"[{label}] ✅ Done — sent {sent}/{len(paths)} files."
+                if failed:
+                    summary += f"\n⚠️ {len(failed)} failed to send. First error: {failed[0][:200]}"
+                await safe_edit(status_msg, summary + notes)
+                return
+
+            await safe_edit(status_msg, f"[{label}] 📦 Zipping {len(paths)} files…")
+            zip_path = os.path.join(job_dir, "files.zip")
+            try:
+                await asyncio.to_thread(zip_files, paths, zip_path)
+            except Exception:
+                logger.exception("[%s/%s] zipping failed", label, provider)
+                await safe_edit(status_msg, f"[{label}] ⚠️ Failed while zipping the downloaded files.")
+                return
+
+            if os.path.getsize(zip_path) <= TELEGRAM_DOC_SIZE_LIMIT:
+                async def _send_zip():
+                    with open(zip_path, "rb") as f:
+                        return await context.bot.send_document(
+                            chat_id=chat_id, document=f, filename=f"{label}_{safe_query}.zip",
+                            caption=f"[{label}] {len(paths)} files for “{query}”", **UPLOAD_TIMEOUTS)
+                await _send_with_telegram_retry(_send_zip)
+            else:
+                os.remove(zip_path)
+                batches = chunk_by_size(paths, TELEGRAM_DOC_SIZE_LIMIT - 2 * 1024 * 1024)
+                for i, batch in enumerate(batches, start=1):
+                    batch_zip = os.path.join(job_dir, f"files_part{i}.zip")
+                    await asyncio.to_thread(zip_files, batch, batch_zip)
+
+                    async def _send_zip_part(path=batch_zip, part=i):
+                        with open(path, "rb") as f:
+                            return await context.bot.send_document(
+                                chat_id=chat_id, document=f, filename=f"{label}_{safe_query}_part{part}.zip",
+                                caption=f"[{label}] Part {part}/{len(batches)}", **UPLOAD_TIMEOUTS)
+                    await _send_with_telegram_retry(_send_zip_part)
+
+            await safe_edit(status_msg, f"[{label}] ✅ Done — archive contains {len(paths)} files.{notes}")
+
+        await asyncio.wait_for(_do_job(), timeout=job_timeout)
+
+    except asyncio.TimeoutError:
+        await safe_edit(status_msg, f"[{label}] ⚠️ Timed out after {job_timeout}s. Try a smaller count or another source.")
+    except RuntimeError as e:
+        await safe_edit(status_msg, f"[{label}] ⚠️ {e}")
+    except aiohttp.ClientError as e:
+        await safe_edit(status_msg, f"[{label}] ⚠️ {provider} failed: {short_error(e)}")
+    except Exception as e:
+        logger.exception("[%s/%s] run_search_job failed", label, provider)
+        await safe_edit(status_msg, f"[{label}] ⚠️ Unexpected error: {short_error(e)}")
+    finally:
+        shutil.rmtree(job_dir, ignore_errors=True)
+
+
+# ---------------------------------------------------------------------------
+# Health endpoint (Deplexo / Docker hosts expect something listening on $PORT)
+# ---------------------------------------------------------------------------
+
+async def start_health_server(app: Application):
+    from aiohttp import web
+
+    port = int(os.getenv("PORT", "8080"))
+
+    async def health(_request):
+        return web.Response(text="ok")
+
+    web_app = web.Application()
+    web_app.router.add_get("/", health)
+    web_app.router.add_get("/health", health)
+    runner = web.AppRunner(web_app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", port).start()
+    logger.info("Health check server listening on 0.0.0.0:%d", port)
+
+
+def main():
+    if not TELEGRAM_BOT_TOKEN:
+        raise SystemExit("Set TELEGRAM_BOT_TOKEN in your environment or .env file before running.")
+
+    # concurrent_updates: without it python-telegram-bot handles ONE update at a time, so a
+    # multi-minute download froze the bot for everyone (other users, other buttons).
+    # The default connection pool is 1 connection / 1 s wait: with concurrent updates, two
+    # jobs editing or uploading at once would fail with "pool timeout".
+    app = (Application.builder().token(TELEGRAM_BOT_TOKEN).concurrent_updates(True)
+           .connection_pool_size(32).pool_timeout(30)
+           .connect_timeout(30).read_timeout(60).write_timeout(120)
+           .post_init(start_health_server).build())
+    app.add_handler(CommandHandler("start", start_cmd))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("providers", providers_cmd))
+    app.add_handler(CommandHandler("search", search_cmd))
+    app.add_handler(CommandHandler("overlay", overlay_cmd))
+    app.add_handler(CallbackQueryHandler(handle_overlay_button, pattern=r"^ov\|"))
+    app.add_handler(CallbackQueryHandler(handle_wizard_button, pattern=r"^wz\|"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_plain_text))
+
+    async def on_error(update, context):
+        err = context.error
+        if isinstance(err, BadRequest) and "not modified" in str(err).lower():
+            return  # double-tapped button: harmless
+        logger.error("Unhandled error while processing an update", exc_info=err)
+
+    app.add_error_handler(on_error)
+
+    logger.info("Bot starting… configured providers: %s", configured_providers())
+
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_closed():
+            raise RuntimeError("the current event loop is closed")
+    except RuntimeError:
+        asyncio.set_event_loop(asyncio.new_event_loop())
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
+
+
+=========================== requirements.txt ===========================
+
+python-telegram-bot>=21.10,<22
+aiohttp>=3.9
+python-dotenv>=1.0
+Pillow>=10.0
