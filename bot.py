@@ -22,7 +22,6 @@ Requirements: see requirements.txt and README.md.
 """
 
 import asyncio
-import contextlib
 import hashlib
 import logging
 import math
@@ -41,10 +40,7 @@ from typing import List, Optional
 import aiohttp
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFile
-from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
-    InputMediaPhoto, InputMediaDocument, InputMediaAudio,
-)
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
 from telegram.error import RetryAfter, NetworkError, TimedOut, BadRequest
 from telegram.ext import (
@@ -58,6 +54,14 @@ from telegram.ext import (
 
 load_dotenv()
 
+
+def _env(name: str, default: str = "") -> str:
+    """Read an env var, stripping stray whitespace/newlines and wrapping quotes (a common cause of HTTP 401)."""
+    value = (os.getenv(name, default) or "").strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1].strip()
+    return value
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -68,22 +72,22 @@ logger = logging.getLogger("photo_bot")
 # Configuration
 # ---------------------------------------------------------------------------
 
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
-PIXABAY_API_KEY = os.getenv("PIXABAY_API_KEY", "")
-UNSPLASH_ACCESS_KEY = os.getenv("UNSPLASH_ACCESS_KEY", "")
-GOOGLE_CSE_API_KEY = os.getenv("GOOGLE_CSE_API_KEY", "")
-GOOGLE_CSE_ENGINE_ID = os.getenv("GOOGLE_CSE_ENGINE_ID", "")
-SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")
-GIPHY_API_KEY = os.getenv("GIPHY_API_KEY", "")
-TENOR_API_KEY = os.getenv("TENOR_API_KEY", "")  # dead, kept so old .env files don't break
-FREESOUND_API_KEY = os.getenv("FREESOUND_API_KEY", "")
-GELBOORU_API_KEY = os.getenv("GELBOORU_API_KEY", "").strip()
-GELBOORU_USER_ID = os.getenv("GELBOORU_USER_ID", "").strip()
-DANBOORU_USER_ID = os.getenv("DANBOORU_USER_ID", "").strip()
-DANBOORU_USERNAME = os.getenv("DANBOORU_USERNAME", "").strip()
-DANBOORU_API_KEY = os.getenv("DANBOORU_API_KEY", "").strip()
-DANBOORU_CONTACT = os.getenv("DANBOORU_CONTACT", "").strip()
+TELEGRAM_BOT_TOKEN = _env("TELEGRAM_BOT_TOKEN")
+PEXELS_API_KEY = _env("PEXELS_API_KEY")
+PIXABAY_API_KEY = _env("PIXABAY_API_KEY")
+UNSPLASH_ACCESS_KEY = _env("UNSPLASH_ACCESS_KEY")
+GOOGLE_CSE_API_KEY = _env("GOOGLE_CSE_API_KEY")
+GOOGLE_CSE_ENGINE_ID = _env("GOOGLE_CSE_ENGINE_ID")
+SERPAPI_KEY = _env("SERPAPI_KEY")
+GIPHY_API_KEY = _env("GIPHY_API_KEY")
+TENOR_API_KEY = _env("TENOR_API_KEY")  # dead, kept so old .env files don't break
+FREESOUND_API_KEY = _env("FREESOUND_API_KEY")
+GELBOORU_API_KEY = _env("GELBOORU_API_KEY")
+GELBOORU_USER_ID = _env("GELBOORU_USER_ID")
+DANBOORU_USER_ID = _env("DANBOORU_USER_ID")
+DANBOORU_USERNAME = _env("DANBOORU_USERNAME")
+DANBOORU_API_KEY = _env("DANBOORU_API_KEY")
+DANBOORU_CONTACT = _env("DANBOORU_CONTACT")
 
 
 def _read_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -101,13 +105,21 @@ def _read_int_env(name: str, default: int, minimum: int, maximum: int) -> int:
 
 
 MAX_ANIME_6K_CANDIDATES = _read_int_env("MAX_ANIME_6K_CANDIDATES", 100, 10, 300)
+# Re-encoding an image to fit Telegram's 50 MB limit decodes it fully in RAM (~3 bytes/pixel,
+# more while converting). Bigger images are skipped instead of crashing small servers.
+REENCODE_MAX_PIXELS = _read_int_env("REENCODE_MAX_PIXELS", 80_000_000, 10_000_000, 500_000_000)
+MAX_CONCURRENT_JOBS = _read_int_env("MAX_CONCURRENT_JOBS", 2, 1, 10)
+MIN_FREE_DISK_MB = _read_int_env("MIN_FREE_DISK_MB", 150, 20, 100_000)
+BOORU_PROXY = _env("BOORU_PROXY")   # optional http://user:pass@host:port for Konachan / Yande.re
+OPENVERSE_CLIENT_ID = _env("OPENVERSE_CLIENT_ID")
+OPENVERSE_CLIENT_SECRET = _env("OPENVERSE_CLIENT_SECRET")
 TELEGRAM_PHOTO_SIZE_LIMIT = 9 * 1024 * 1024  # margin below Telegram's 10 MiB photo cap
 
 # BUG FIX (6K+ images): Pillow refuses to even open images above ~179 million
 # pixels (DecompressionBombError), which made big wallpapers/art look "broken"
 # and get silently dropped. Raise the ceiling for our own, size-capped
 # downloads (MAX_DOWNLOAD_BYTES) and silence the softer warning.
-Image.MAX_IMAGE_PIXELS = 700_000_000
+Image.MAX_IMAGE_PIXELS = 300_000_000
 ImageFile.MAXBLOCK = 64 * 1024 * 1024  # large JPEG/PNG encodes fail with the default buffer
 ImageFile.LOAD_TRUNCATED_IMAGES = False
 warnings.simplefilter("ignore", Image.DecompressionBombWarning)
@@ -117,9 +129,10 @@ DEFAULT_COUNT = 10
 WEB_ENGINE_DEFAULT_COUNT = 15
 MAX_COUNT = 30
 MIN_WIDTH_FOR_YOUTUBE = 1280
-CONCURRENT_DOWNLOADS = 6
-GLOBAL_CONCURRENT_DOWNLOADS = _read_int_env("GLOBAL_CONCURRENT_DOWNLOADS", 12, 1, 64)
+CONCURRENT_DOWNLOADS = _read_int_env("CONCURRENT_DOWNLOADS", 4, 1, 12)
+GLOBAL_CONCURRENT_DOWNLOADS = _read_int_env("GLOBAL_CONCURRENT_DOWNLOADS", 8, 1, 64)
 GLOBAL_DOWNLOAD_SEMAPHORE = asyncio.Semaphore(GLOBAL_CONCURRENT_DOWNLOADS)
+JOB_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 DOWNLOAD_CHUNK_BYTES = 64 * 1024
 MAX_DOWNLOAD_BYTES = 150 * 1024 * 1024
 TELEGRAM_DOC_SIZE_LIMIT = 45 * 1024 * 1024  # keep under the 50MB bot API cap
@@ -233,6 +246,33 @@ def short_error(exc: BaseException) -> str:
     return str(exc)[:120] or type(exc).__name__
 
 
+KEY_ENV = {
+    "pexels": "PEXELS_API_KEY", "pixabay": "PIXABAY_API_KEY", "unsplash": "UNSPLASH_ACCESS_KEY",
+    "giphy": "GIPHY_API_KEY", "freesound": "FREESOUND_API_KEY",
+}
+
+
+def describe_error(name: str, exc: BaseException) -> str:
+    """short_error plus an actionable hint for the usual causes of 401/403/429."""
+    base = short_error(exc)
+    status = exc.status if isinstance(exc, aiohttp.ClientResponseError) else None
+    if status is None:
+        m = re.match(r"HTTP (\d{3})", str(exc)) if isinstance(exc, RuntimeError) else None
+        status = int(m.group(1)) if m else None
+    if status == 429:
+        return f"{base} — rate-limited, try again in a minute"
+    if status in (401, 403):
+        if name in KEY_ENV:
+            return f"{base} — {KEY_ENV[name]} was rejected (typo, key not activated yet, revoked, or rate limit)"
+        if name == "openverse":
+            return (f"{base} — Openverse refused this server; set the free OPENVERSE_CLIENT_ID and "
+                    f"OPENVERSE_CLIENT_SECRET (see README)")
+        if name in ("konachan", "yandere", "safebooru", "gelbooru"):
+            return (f"{base} — {name} is blocking this server (hosting IPs are often banned); "
+                    f"set BOORU_PROXY or use another source")
+    return base
+
+
 def _split_tags(query: str) -> List[str]:
     raw = [t.strip() for t in re.split(r"[,\n]", query) if t.strip()]
     return [t.replace(" ", "_") for t in raw]
@@ -334,16 +374,43 @@ async def search_unsplash(session: aiohttp.ClientSession, query: str, count: int
     return results
 
 
+_OPENVERSE_TOKEN = {"value": None, "expires": 0.0}
+
+
+async def _openverse_headers(session) -> dict:
+    """Anonymous by default; uses free OAuth credentials when configured (avoids most 403s)."""
+    headers = {"Accept": "application/json"}
+    if not (OPENVERSE_CLIENT_ID and OPENVERSE_CLIENT_SECRET):
+        return headers
+    if not _OPENVERSE_TOKEN["value"] or _OPENVERSE_TOKEN["expires"] < time.monotonic() + 60:
+        try:
+            async with session.post("https://api.openverse.org/v1/auth_tokens/token/", data={
+                "grant_type": "client_credentials",
+                "client_id": OPENVERSE_CLIENT_ID,
+                "client_secret": OPENVERSE_CLIENT_SECRET,
+            }) as resp:
+                resp.raise_for_status()
+                data = await resp.json(content_type=None)
+            _OPENVERSE_TOKEN["value"] = data.get("access_token")
+            _OPENVERSE_TOKEN["expires"] = time.monotonic() + _safe_int(data.get("expires_in"), 3600)
+        except Exception as exc:
+            logger.warning("Openverse token request failed (%s); continuing anonymously", short_error(exc))
+    if _OPENVERSE_TOKEN["value"]:
+        headers["Authorization"] = f"Bearer {_OPENVERSE_TOKEN['value']}"
+    return headers
+
+
 async def search_openverse(session: aiohttp.ClientSession, query: str, count: int, **kwargs) -> List[ImageResult]:
     """Openverse -- keyless CC / public-domain search, commercial licenses forced."""
     wanted = max(min(count * 3, 60), 20)
     wanted_ext = (kwargs.get("file_type") or "").lower().lstrip(".")
     results: List[ImageResult] = []
+    ov_headers = await _openverse_headers(session)
     for page in range(1, (wanted + 19) // 20 + 1):
         params = {"q": query, "license_type": "commercial", "page_size": 20, "page": page}
         if wanted_ext:
             params["extension"] = "jpg" if wanted_ext == "jpeg" else wanted_ext
-        async with session.get("https://api.openverse.org/v1/images/", params=params) as resp:
+        async with session.get("https://api.openverse.org/v1/images/", params=params, headers=ov_headers) as resp:
             if resp.status == 404 and page > 1:  # ran past the last page
                 break
             resp.raise_for_status()
@@ -426,7 +493,7 @@ async def _mix_providers(names, session, query: str, count: int, label: str, **k
     for name, batch in zip(names, batches):
         if isinstance(batch, BaseException):
             logger.warning("%s source %s failed: %s", label, name, batch)
-            errors.append(f"{name}: {short_error(batch)}")
+            errors.append(f"{name}: {describe_error(name, batch)}")
             mark_failed(name, batch)
             continue
         items = []
@@ -616,11 +683,11 @@ def _clean_autocomplete(data, limit: int) -> List[str]:
     return tags[:limit]
 
 
-async def _autocomplete_get(url: str, params: dict, headers: Optional[dict] = None):
+async def _autocomplete_get(url: str, params: dict, headers: Optional[dict] = None, proxy: Optional[str] = None):
     try:
         timeout = aiohttp.ClientTimeout(total=10)
-        async with aiohttp.ClientSession(timeout=timeout, headers=headers or HTTP_HEADERS) as session:
-            async with session.get(url, params=params) as resp:
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers or HTTP_HEADERS, trust_env=True) as session:
+            async with session.get(url, params=params, proxy=proxy) as resp:
                 resp.raise_for_status()
                 try:
                     return await resp.json(content_type=None)
@@ -656,23 +723,38 @@ MOEBOORU_HOSTS = {
 
 
 async def _moebooru_fetch(session, source: str, tag_string: str, limit: int) -> list:
-    """Try each known host; a 403 / Cloudflare HTML page on one falls through to the next."""
+    """
+    Query Yande.re / Konachan. Tries every known host and both API paths, and retries a
+    403 with a minimal browser header set. Logs what the server answered so a block
+    (Cloudflare / banned hosting IP) is visible in the logs. Honours BOORU_PROXY.
+    """
     last_exc: Optional[BaseException] = None
+    proxy = BOORU_PROXY or None
     for host in MOEBOORU_HOSTS[source]:
-        for attempt in range(2):
-            try:
-                headers = {**BROWSER_HEADERS, "Referer": f"{host}/post"}
-                async with session.get(f"{host}/post.json", params={"tags": tag_string, "limit": limit},
-                                       headers=headers) as resp:
-                    if resp.status == 429 and attempt == 0:
-                        await asyncio.sleep(2)
-                        continue
-                    resp.raise_for_status()
-                    data = await resp.json(content_type=None)
-                return data if isinstance(data, list) else []
-            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
-                last_exc = exc
-                break   # next host
+        for path in ("/post.json", "/post/index.json"):
+            status = None
+            for variant in (0, 1):
+                headers = ({**BROWSER_HEADERS, "Referer": f"{host}/post"} if variant == 0
+                           else {"User-Agent": BROWSER_HEADERS["User-Agent"]})
+                try:
+                    async with session.get(f"{host}{path}", params={"tags": tag_string, "limit": limit},
+                                           headers=headers, proxy=proxy) as resp:
+                        if resp.status >= 400:
+                            logger.warning("%s%s -> HTTP %s (server=%s, cf-ray=%s)", host, path, resp.status,
+                                           resp.headers.get("Server"), resp.headers.get("CF-RAY"))
+                        resp.raise_for_status()
+                        data = await resp.json(content_type=None)
+                    return data if isinstance(data, list) else []
+                except aiohttp.ClientResponseError as exc:
+                    last_exc, status = exc, exc.status
+                    if exc.status == 403 and variant == 0:
+                        continue            # retry once with minimal headers
+                    break
+                except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+                    last_exc, status = exc, -1
+                    break
+            if status != 404:               # only a 404 means "wrong path": anything else -> next host
+                break
     raise last_exc or RuntimeError(f"{source}: no host answered")
 
 
@@ -730,7 +812,7 @@ async def _moebooru_autocomplete(source: str, partial: str, limit: int = 8) -> L
     for host in MOEBOORU_HOSTS[source]:
         data = await _autocomplete_get(
             f"{host}/tag.json", {"name_pattern": f"*{partial}*", "limit": limit, "order": "count"},
-            BROWSER_HEADERS)
+            BROWSER_HEADERS, proxy=BOORU_PROXY or None)
         names = _clean_autocomplete(data, limit)
         if names:
             return names
@@ -1227,7 +1309,8 @@ async def download_one(session: aiohttp.ClientSession, img: ImageResult, dest_di
             tmp_path = None
             try:
                 timeout = aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT, sock_read=60)
-                async with session.get(img.url, timeout=timeout, headers=request_headers) as resp:
+                proxy = BOORU_PROXY if (BOORU_PROXY and img.source in ("konachan", "yandere")) else None
+                async with session.get(img.url, timeout=timeout, headers=request_headers, proxy=proxy) as resp:
                     if resp.status == 429 or 500 <= resp.status < 600:
                         raw_retry = resp.headers.get("Retry-After", "")
                         try:
@@ -1357,6 +1440,12 @@ def validate_and_fit(path: str, wanted_exts: Optional[set], min_dimension: int):
     limit = TELEGRAM_DOC_SIZE_LIMIT - 512 * 1024
     if os.path.getsize(path) > limit:
         if ext in IMAGE_EXTS - {"svg", "gif"}:
+            dims = _image_dimensions(path)
+            if dims and dims[0] * dims[1] > REENCODE_MAX_PIXELS:
+                # Decoding this much pixel data would need gigabytes of RAM and crash the server.
+                logger.warning("Skipping %s: %dx%d is too large to re-encode safely (REENCODE_MAX_PIXELS=%d)",
+                               path, dims[0], dims[1], REENCODE_MAX_PIXELS)
+                return drop()
             fitted = _shrink_to_fit(path, limit)
             if fitted:
                 return fitted, True
@@ -1373,10 +1462,7 @@ async def collect_media(session, candidates: List[ImageResult], job_dir: str, ne
     result (hence "sent 1/1 files").
     Returns (paths, failed_count, shrunk_count).
     """
-    wanted_exts = None
-    if file_type:
-        w = file_type.lower().lstrip(".")
-        wanted_exts = {"jpg", "jpeg"} if w in ("jpg", "jpeg") else {w}
+    wanted_exts = _wanted_exts(file_type)
     sem = asyncio.Semaphore(CONCURRENT_DOWNLOADS)
     paths: List[str] = []
     failed = shrunk = idx = 0
@@ -1402,7 +1488,7 @@ async def collect_media(session, candidates: List[ImageResult], job_dir: str, ne
 
 
 def zip_files(paths: List[str], zip_path: str) -> str:
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:   # images are already compressed
         for p in paths:
             zf.write(p, arcname=os.path.basename(p))
     return zip_path
@@ -1493,90 +1579,85 @@ async def send_single_file(context: ContextTypes.DEFAULT_TYPE, chat_id: int, pat
     return await _send_with_telegram_retry(_send)
 
 
-ALBUM_SIZE = 10          # Telegram's maximum items per album (media group)
-ALBUM_PAUSE_SECONDS = 2.0
+def _wanted_exts(file_type: Optional[str]) -> Optional[set]:
+    if not file_type:
+        return None
+    w = file_type.lower().lstrip(".")
+    return {"jpg", "jpeg"} if w in ("jpg", "jpeg") else {w}
 
 
-def _photo_eligible(path: str) -> bool:
-    """Can Telegram show this file as a photo (size, dimensions and aspect ratio limits)?"""
-    ext = path.rsplit(".", 1)[-1].lower()
-    if ext not in PHOTO_EXTS or os.path.getsize(path) > TELEGRAM_PHOTO_SIZE_LIMIT:
-        return False
-    dims = _image_dimensions(path)
-    if dims:
-        w, h = dims
-        if w + h > 10000 or max(w, h) / max(min(w, h), 1) > 20:
-            return False
-    return True
-
-
-def album_kind(path: str) -> str:
-    ext = path.rsplit(".", 1)[-1].lower()
-    if ext == "gif":
-        return "anim"       # animations cannot be put in albums
-    if ext in AUDIO_EXTS:
-        return "audio"
-    return "photo" if _photo_eligible(path) else "doc"
-
-
-async def send_album(context: ContextTypes.DEFAULT_TYPE, chat_id: int, paths: List[str], kind: str, caption: str):
-    """Send 2-10 files as ONE album message group (all photos, all documents, or all audio)."""
-    media_cls = {"photo": InputMediaPhoto, "doc": InputMediaDocument, "audio": InputMediaAudio}[kind]
-
-    async def _send():
-        with contextlib.ExitStack() as stack:   # files stay open until Telegram has them; reopened on retry
-            media = [media_cls(media=stack.enter_context(open(p, "rb")), caption=(caption[:900] if i == 0 else None))
-                     for i, p in enumerate(paths)]
-            return await context.bot.send_media_group(chat_id=chat_id, media=media, **UPLOAD_TIMEOUTS)
-
-    return await _send_with_telegram_retry(_send)
-
-
-async def deliver_as_albums(context, chat_id: int, paths: List[str], label: str, query: str, status_msg=None):
-    """
-    "Send individually" delivery. Files go out in albums of up to 10 instead of one message
-    per file (which took ~1.1 s each and flooded the chat). Photos, documents (large / 6K
-    images) and audio are grouped separately because Telegram cannot mix them in one album;
-    GIFs are sent as animations. A failed album falls back to one-by-one so nothing is lost.
-    Returns (sent_count, error_messages).
-    """
-    groups = {"photo": [], "doc": [], "audio": [], "anim": []}
-    for p in paths:
-        groups[album_kind(p)].append(p)
-    total, sent, errors = len(paths), 0, []
-
-    async def single(p):
-        nonlocal sent
+def _remove_quietly(path: Optional[str]):
+    if path:
         try:
-            await send_single_file(context, chat_id, p, caption=f"[{label}] “{query}”")
-            sent += 1
-        except Exception as exc:
-            errors.append(str(exc))
-            logger.exception("[%s] failed to send %s", label, p)
+            os.remove(path)
+        except OSError:
+            pass
 
-    for kind in ("photo", "doc", "audio"):
-        items = groups[kind]
-        for i in range(0, len(items), ALBUM_SIZE):
-            batch = items[i:i + ALBUM_SIZE]
-            if len(batch) == 1:
-                await single(batch[0])
-            else:
-                caption = f"[{label}] “{query}” — {sent + 1}-{sent + len(batch)} of {total}"
-                try:
-                    await send_album(context, chat_id, batch, kind, caption)
-                    sent += len(batch)
-                except Exception:
-                    logger.exception("[%s] album failed; sending its %d files one by one", label, len(batch))
-                    for p in batch:
-                        await single(p)
-                        await asyncio.sleep(1.1)
-            if status_msg is not None:
-                await safe_edit(status_msg, f"[{label}] Sending… {sent}/{total} delivered.")
-            await asyncio.sleep(ALBUM_PAUSE_SECONDS)   # stay inside Telegram's per-chat rate limit
-    for p in groups["anim"]:
-        await single(p)
-        await asyncio.sleep(1.1)
-    return sent, errors
+
+def _empty_message(label, big_search, min_dimension, file_type, n_candidates, provider_errors) -> str:
+    if big_search:
+        msg = (f"[{label}] No downloaded image reached {min_dimension:,} px on its longest side. "
+               f"Try another tag/source, a lower threshold, or raise MAX_ANIME_6K_CANDIDATES "
+               f"(now {MAX_ANIME_6K_CANDIDATES}).")
+    elif file_type:
+        msg = f"[{label}] None of the results were actually {file_type} files."
+    else:
+        msg = f"[{label}] All {n_candidates} candidate downloads failed or were invalid."
+    if provider_errors:
+        msg += "\nSources unavailable: " + "; ".join(provider_errors[:5])
+    return msg + " Try a different query or source."
+
+
+async def stream_individual(context, chat_id: int, session, candidates: List[ImageResult], job_dir: str,
+                            need: int, file_type: Optional[str], min_dimension: int,
+                            label: str, query: str, status_msg):
+    """
+    "Send individually": strictly ONE file at a time -- download, check, send, DELETE it
+    from disk, then fetch the next. Peak disk use is a single file and nothing piles up
+    (the old flow downloaded everything first, which could exhaust a small server).
+    Returns (sent, skipped, reencoded, send_errors).
+    """
+    wanted = _wanted_exts(file_type)
+    one_at_a_time = asyncio.Semaphore(1)
+    sent = skipped = reencoded = consecutive_send_errors = 0
+    errors: List[str] = []
+    for tried, img in enumerate(candidates, start=1):
+        if sent >= need or consecutive_send_errors >= 3:
+            break
+        path = await download_one(session, img, job_dir, one_at_a_time)
+        if not path:
+            skipped += 1
+            continue
+        try:
+            checked = await asyncio.to_thread(validate_and_fit, path, wanted, min_dimension)
+            if checked is None:
+                path = None             # validate_and_fit already deleted it
+                skipped += 1
+                continue
+            path, was_shrunk = checked
+            await send_single_file(context, chat_id, path, caption=f"[{label}] {sent + 1}/{need} “{query}”")
+            sent += 1
+            reencoded += 1 if was_shrunk else 0
+            consecutive_send_errors = 0
+        except Exception as exc:
+            consecutive_send_errors += 1
+            errors.append(short_error(exc))
+            logger.exception("[%s] failed to send a file", label)
+        finally:
+            _remove_quietly(path)       # free the disk BEFORE the next download starts
+        await safe_edit(status_msg, f"[{label}] 🖼 Sent {sent}/{need} ({tried}/{len(candidates)} candidates tried)")
+        if sent < need:
+            await asyncio.sleep(1.1)    # Telegram allows ~1 message/second per chat
+    return sent, skipped, reencoded, errors
+
+
+def cleanup_workdir():
+    """Remove job folders left behind by a crash/restart (they can fill a small disk)."""
+    try:
+        for name in os.listdir(WORKDIR):
+            shutil.rmtree(os.path.join(WORKDIR, name), ignore_errors=True)
+    except OSError:
+        pass
 
 
 async def safe_edit(msg, text: str, **kwargs):
@@ -1603,7 +1684,7 @@ START_TEXT = (
     "4️⃣ Anime — Safebooru, Yande.re, Konachan, Danbooru, Gelbooru, or a random mix of all\n\n"
     "After you pick a source, the bot suggests related words/tags for what you typed.\n"
     "Then choose count, resolution (anime also offers 6K/7K/8K/10K+) and delivery "
-    "(one zip, or albums of up to 10 files).\n\n"
+    "(one zip, or one file at a time).\n\n"
     "Power commands:\n"
     "/search <query> [count] [provider] [type:png|jpg|gif] [minscore:N]\n"
     "/overlay arrow red up-right\n"
@@ -1786,7 +1867,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "3. Sound (Freesound, CC0/Attribution only)\n"
         "4. Anime: Safebooru, Yande.re, Konachan, Danbooru, Gelbooru, or 🎲 random from all\n\n"
         "Every path first offers suggestions for your word (tags for anime, related terms for stock/sound, Giphy tags for GIF), "
-        "then asks for count (5-30), minimum resolution and delivery (one zip, or albums of up to 10 files). "
+        "then asks for count (5-30), minimum resolution and delivery (one zip, or one file at a time). "
         "Anime resolution also offers 6K+, 7K+, 8K+, 10K+ and a custom 6000-30000 px threshold, "
         "measured on the image's longest side. Images over Telegram's 50 MB limit are re-encoded "
         "as same-size JPEG so they can still be delivered.\n\n"
@@ -1799,7 +1880,7 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "  e.g. /search hatsune_miku 20 yandere type:png minscore:80\n"
         "  e.g. /search mount fuji 15 stockmix\n"
         "  e.g. /search shinobu_oshino 12 animemix\n"
-        "  (/search always zips; use the buttons for album delivery or sort/resolution choices)\n"
+        "  (/search always zips; use the buttons for one-by-one delivery or sort/resolution choices)\n"
         "/providers — list enabled providers\n"
         "/overlay — thumbnail arrows/circles/boxes/stars, e.g. /overlay arrow red up-right\n\n"
         "Booru tags use Japanese name order (furudo_erika, not erika_furudo); the bot looks tags up for you.\n"
@@ -1948,7 +2029,7 @@ ANIME_DIMENSION_OPTIONS = [
     ("🧩 10K+ (10,000px)", "min:10000"),
     ("✏️ Custom…", "custom"),
 ]
-DELIVERY_OPTIONS = [("📦 Zip file", "zip"), ("🖼 Send as albums", "individual")]
+DELIVERY_OPTIONS = [("📦 Zip file", "zip"), ("🖼 Send one by one", "individual")]
 
 PENDING_SEARCHES: dict = {}
 PENDING_TTL_SECONDS = 30 * 60
@@ -2329,12 +2410,20 @@ async def run_search_job(
     else:
         fetch_n = count * (3 if file_type else 2)
         candidate_cap = max(count * 3, count + 8)
-    job_timeout = min(90 + math.ceil(candidate_cap / CONCURRENT_DOWNLOADS) * DOWNLOAD_TIMEOUT, 3600)
+    if delivery == "individual":
+        job_timeout = min(120 + candidate_cap * 45, 3600)   # files are fetched one at a time
+    else:
+        job_timeout = min(90 + math.ceil(candidate_cap / CONCURRENT_DOWNLOADS) * DOWNLOAD_TIMEOUT, 3600)
 
     try:
         async def _do_job():
             async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=DOWNLOAD_TIMEOUT),
-                                             headers=HTTP_HEADERS) as session:
+                                             headers=HTTP_HEADERS, trust_env=True) as session:
+                free_mb = shutil.disk_usage(WORKDIR).free // (1024 * 1024)
+                if free_mb < MIN_FREE_DISK_MB:
+                    await safe_edit(status_msg, f"[{label}] ⚠️ The server is low on disk space ({free_mb} MB free). "
+                                                f"Try again in a moment.")
+                    return
                 search_output = await PROVIDERS[provider](session, query, fetch_n, **extra)
                 provider_errors = list(getattr(search_output, "provider_errors", []))
                 raw_results = dedupe_image_results(search_output)
@@ -2371,6 +2460,29 @@ async def run_search_job(
                     return
 
                 suffix = f" (looking for {min_dimension:,}px+ originals)" if big_search else ""
+                if delivery == "individual":
+                    await safe_edit(status_msg, f"[{label}] 🖼 Sending one by one… 0/{count}{suffix}")
+                    sent, skipped, reencoded, send_errors = await stream_individual(
+                        context, chat_id, session, chosen, job_dir, count, file_type, min_dimension,
+                        label, query, status_msg)
+                    if sent == 0 and not send_errors:
+                        await safe_edit(status_msg, _empty_message(
+                            label, big_search, min_dimension, file_type, len(chosen), provider_errors))
+                        return
+                    summary = f"[{label}] ✅ Done — sent {sent}/{count} files."
+                    if sent < count:
+                        summary += f"\nℹ️ Only {sent} of {count} valid files could be found."
+                    if reencoded:
+                        summary += f"\nℹ️ {reencoded} file(s) over Telegram's 50 MB limit were re-encoded as same-size JPEG."
+                    if skipped:
+                        summary += f"\nℹ️ {skipped} candidate(s) skipped (dead links, blocks, wrong type, too small or too big)."
+                    if send_errors:
+                        summary += f"\n⚠️ Telegram upload errors: {send_errors[0][:200]}"
+                    if provider_errors:
+                        summary += "\n⚠️ Some sources were unavailable: " + "; ".join(provider_errors[:5])
+                    await safe_edit(status_msg, summary)
+                    return
+
                 await safe_edit(status_msg, f"[{label}] ⬇️ Downloading… 0/{count}{suffix}")
 
                 async def progress(done, need, tried, total):
@@ -2380,17 +2492,8 @@ async def run_search_job(
                     session, chosen, job_dir, count, file_type, min_dimension, progress)
 
             if not paths:
-                if big_search:
-                    msg = (f"[{label}] No downloaded image reached {min_dimension:,} px on its longest side. "
-                           f"Try another tag/source, a lower threshold, or raise MAX_ANIME_6K_CANDIDATES "
-                           f"(now {MAX_ANIME_6K_CANDIDATES}).")
-                elif file_type:
-                    msg = f"[{label}] None of the results were actually {file_type} files."
-                else:
-                    msg = f"[{label}] All {len(chosen)} candidate downloads failed or were invalid."
-                if provider_errors:
-                    msg += "\nSources unavailable: " + "; ".join(provider_errors[:5])
-                await safe_edit(status_msg, msg + " Try a different query or source.")
+                await safe_edit(status_msg, _empty_message(
+                    label, big_search, min_dimension, file_type, len(chosen), provider_errors))
                 return
 
             notes = ""
@@ -2405,15 +2508,6 @@ async def run_search_job(
 
             safe_query = re.sub(r"[^a-zA-Z0-9]+", "_", query)[:30]
 
-            if delivery == "individual":
-                await safe_edit(status_msg, f"[{label}] 🖼 Sending {len(paths)} files…")
-                sent, failed = await deliver_as_albums(context, chat_id, paths, label, query, status_msg)
-                summary = f"[{label}] ✅ Done — sent {sent}/{len(paths)} files."
-                if failed:
-                    summary += f"\n⚠️ {len(failed)} failed to send. First error: {failed[0][:200]}"
-                await safe_edit(status_msg, summary + notes)
-                return
-
             await safe_edit(status_msg, f"[{label}] 📦 Zipping {len(paths)} files…")
             zip_path = os.path.join(job_dir, "files.zip")
             try:
@@ -2424,6 +2518,8 @@ async def run_search_job(
                 return
 
             if os.path.getsize(zip_path) <= TELEGRAM_DOC_SIZE_LIMIT:
+                for p in paths:
+                    _remove_quietly(p)      # free the disk BEFORE uploading the archive
                 async def _send_zip():
                     with open(zip_path, "rb") as f:
                         return await context.bot.send_document(
@@ -2436,6 +2532,8 @@ async def run_search_job(
                 for i, batch in enumerate(batches, start=1):
                     batch_zip = os.path.join(job_dir, f"files_part{i}.zip")
                     await asyncio.to_thread(zip_files, batch, batch_zip)
+                    for p in batch:
+                        _remove_quietly(p)
 
                     async def _send_zip_part(path=batch_zip, part=i):
                         with open(path, "rb") as f:
@@ -2446,14 +2544,18 @@ async def run_search_job(
 
             await safe_edit(status_msg, f"[{label}] ✅ Done — archive contains {len(paths)} files.{notes}")
 
-        await asyncio.wait_for(_do_job(), timeout=job_timeout)
+        if JOB_SEMAPHORE.locked():
+            await safe_edit(status_msg, f"[{label}] ⏳ Queued — {MAX_CONCURRENT_JOBS} download(s) already running; "
+                                        f"yours starts automatically.")
+        async with JOB_SEMAPHORE:      # limit simultaneous heavy jobs so the server cannot be overwhelmed
+            await asyncio.wait_for(_do_job(), timeout=job_timeout)
 
     except asyncio.TimeoutError:
         await safe_edit(status_msg, f"[{label}] ⚠️ Timed out after {job_timeout}s. Try a smaller count or another source.")
     except RuntimeError as e:
-        await safe_edit(status_msg, f"[{label}] ⚠️ {e}")
+        await safe_edit(status_msg, f"[{label}] ⚠️ {describe_error(provider, e) if str(e).startswith('HTTP') else e}")
     except aiohttp.ClientError as e:
-        await safe_edit(status_msg, f"[{label}] ⚠️ {provider} failed: {short_error(e)}")
+        await safe_edit(status_msg, f"[{label}] ⚠️ {provider} failed: {describe_error(provider, e)}")
     except Exception as e:
         logger.exception("[%s/%s] run_search_job failed", label, provider)
         await safe_edit(status_msg, f"[{label}] ⚠️ Unexpected error: {short_error(e)}")
@@ -2490,6 +2592,7 @@ def main():
     # multi-minute download froze the bot for everyone (other users, other buttons).
     # The default connection pool is 1 connection / 1 s wait: with concurrent updates, two
     # jobs editing or uploading at once would fail with "pool timeout".
+    cleanup_workdir()   # delete temp folders left by a previous crash
     app = (Application.builder().token(TELEGRAM_BOT_TOKEN).concurrent_updates(True)
            .connection_pool_size(32).pool_timeout(30)
            .connect_timeout(30).read_timeout(60).write_timeout(120)

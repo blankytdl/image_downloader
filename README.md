@@ -12,7 +12,7 @@ Send the bot any word or phrase and pick from a 4-item menu:
 After you pick a source the bot offers **suggestions** for your word — site tags for anime sources
 (Safebooru/Yande.re/Konachan/Danbooru/Gelbooru, and a merged list for the anime mix), Giphy tag suggestions for GIF,
 and related/completed terms (Datamuse, keyless) for stock and sound. Tap one, keep your own text, or type something else;
-if nothing is found the search simply continues as typed. Then choose count (5–30), minimum resolution, and delivery (📦 one zip, or 🖼 albums — up to 10 files per message group instead of one message per file).
+if nothing is found the search simply continues as typed. Then choose count (5–30), minimum resolution, and delivery (📦 one zip, or 🖼 🖼 one file at a time).
 Anime resolution also offers **6K+ / 7K+ / 8K+ / 10K+ / custom (6000–30000 px)**, measured on the
 longest side of the real downloaded file. Anime sources only return safe/general-rated art.
 
@@ -61,8 +61,17 @@ need attribution — check each file's Commons page. Openverse forces commercial
 - GIF: the "Trending" option ignored your word (returned unrelated GIFs) and the HD/Full HD filter would have
   rejected nearly every GIF (Giphy originals are ~480px) — both removed; oversized originals fall back to a smaller
   rendition so they fit Telegram's 50 MB limit.
-- "Send individually" now sends albums of up to 10 files at once (photos, large/6K images as document albums, GIFs as
-  animations); if an album is rejected it falls back to one-by-one, so nothing is lost.
+- **Server crashes / disk and RAM use**: "send one by one" now downloads ONE file, sends it, DELETES it, then fetches the
+  next (peak disk = one file). Zip mode deletes the loose files before uploading the archive. At most
+  `MAX_CONCURRENT_JOBS` (default 2) jobs run at once, others queue. Re-encoding of oversized images is capped
+  (`REENCODE_MAX_PIXELS`) because decoding a huge image needs gigabytes of RAM. Leftover temp folders are deleted at
+  startup, and jobs refuse to start when the disk is nearly full.
+- **Pexels `HTTP 401`**: the key was rejected. Keys are now trimmed of stray spaces/quotes/newlines (a very common cause);
+  if it still fails, the key itself is wrong or not activated — the error message names the variable to check.
+- **Openverse `HTTP 403`**: supports free OAuth credentials (`OPENVERSE_CLIENT_ID` / `OPENVERSE_CLIENT_SECRET`, see
+  `.env.example`) which avoid the anonymous block.
+- **Konachan**: tries both hosts, both API paths and a second header set, logs what the site answered, and supports
+  `BOORU_PROXY` for hosting-IP bans. Error messages now say what to do.
 - The bot no longer freezes for everyone while one long download runs (updates are now processed concurrently);
   expired buttons after a restart still work; an invalid `DEFAULT_PROVIDER` falls back to pexels.
 - Telegram uploads now have a 5-minute timeout (the default ~20 s broke 40 MB zips and 6K files) and the connection
